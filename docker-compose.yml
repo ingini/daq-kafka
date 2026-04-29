@@ -1,3 +1,5 @@
+version: "3.9"
+
 # ============================================================
 #  Camera/IMU → Confluent Kafka → MinIO  Pipeline
 #  Platform : AP500L / Orin
@@ -200,21 +202,14 @@ services:
         condition: service_healthy
     networks:
       - daq-net
-    devices:
-      - /dev/video0:/dev/video0
+    stdin_open: true
     environment:
       KAFKA_BOOTSTRAP: kafka-broker:9092
       KAFKA_TOPIC: sensor.cam0.jpeg
       CAM_DEVICE: /dev/video0
-      CAP_WIDTH: 1920
-      CAP_HEIGHT: 1080
-      CAP_FPS: 20
       OUT_WIDTH: 640
       OUT_HEIGHT: 360
       JPEG_QUALITY: 90
-      PUBLISH_FPS: 1       # Kafka publish 주기 (1fps)
-    group_add:
-      - "44"
 
   cam1-producer:
     build:
@@ -227,21 +222,14 @@ services:
         condition: service_healthy
     networks:
       - daq-net
-    devices:
-      - /dev/video1:/dev/video1
+    stdin_open: true
     environment:
       KAFKA_BOOTSTRAP: kafka-broker:9092
       KAFKA_TOPIC: sensor.cam1.jpeg
       CAM_DEVICE: /dev/video1
-      CAP_WIDTH: 1920
-      CAP_HEIGHT: 1080
-      CAP_FPS: 20
       OUT_WIDTH: 640
       OUT_HEIGHT: 360
       JPEG_QUALITY: 90
-      PUBLISH_FPS: 1
-    group_add:
-      - "44"
 
   cam2-producer:
     build:
@@ -254,21 +242,14 @@ services:
         condition: service_healthy
     networks:
       - daq-net
-    devices:
-      - /dev/video2:/dev/video2
+    stdin_open: true
     environment:
       KAFKA_BOOTSTRAP: kafka-broker:9092
       KAFKA_TOPIC: sensor.cam2.jpeg
       CAM_DEVICE: /dev/video2
-      CAP_WIDTH: 1920
-      CAP_HEIGHT: 1080
-      CAP_FPS: 20
       OUT_WIDTH: 640
       OUT_HEIGHT: 360
       JPEG_QUALITY: 90
-      PUBLISH_FPS: 1
-    group_add:
-      - "44"
 
 # ─────────────────────────────────────────────
 #  4. IMU Producer  (BynavX1 UDP → Kafka)
