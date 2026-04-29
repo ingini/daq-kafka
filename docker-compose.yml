@@ -1,4 +1,4 @@
-version: "3.9"
+# version: "3.9"
 
 # ============================================================
 #  Camera/IMU → Confluent Kafka → MinIO  Pipeline
@@ -146,7 +146,7 @@ services:
 #  2. MinIO  (Object Storage)
 # ─────────────────────────────────────────────
   minio:
-    image: minio/minio:RELEASE.2024-05-01T01-11-10Z
+    image: minio/minio:latest
     container_name: minio
     restart: unless-stopped
     networks:
@@ -168,7 +168,7 @@ services:
 
   # MinIO bucket 초기화
   minio-init:
-    image: minio/mc:RELEASE.2024-05-03T04-40-00Z
+    image: minio/mc:latest
     container_name: minio-init
     depends_on:
       minio:
@@ -285,8 +285,8 @@ services:
     depends_on:
       kafka-broker:
         condition: service_healthy
-    networks:
-      - daq-net
+          #networks:
+          #- daq-net
     network_mode: host          # UDP 수신을 위해 host 네트워크 사용
     environment:
       KAFKA_BOOTSTRAP: "127.0.0.1:29092"   # host network이므로 localhost 사용
