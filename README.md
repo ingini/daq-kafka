@@ -1,6 +1,7 @@
 # DAQ Kafka-MinIO Pipeline
 
-file:///home/swm/%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C/dghan/daq-kafka/kafka_minio_pipeline_architecture.svg
+<img width="1358" height="1038" alt="image" src="https://github.com/user-attachments/assets/9fa9bc6a-71bb-4cea-b97b-4256673b4912" />
+
 
 Camera(V4L2) / IMU(BynavX1) → Confluent Kafka → MinIO S3
 
