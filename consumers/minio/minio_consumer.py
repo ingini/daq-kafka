@@ -134,8 +134,12 @@ def main():
             elif msg.error():
                 if msg.error().code() == KafkaError._PARTITION_EOF:
                     log.debug("EOF partition %d", msg.partition())
+                elif msg.error().code() == KafkaError.UNKNOWN_TOPIC_OR_PART:
+                    # kafka-init 토픽 생성 전에 뜬 경우 – 크래시 없이 대기
+                    log.warning("Topic not ready yet, waiting... (%s)", msg.error())
+                    time.sleep(2)
                 else:
-                    raise KafkaException(msg.error())
+                    log.error("Kafka error: %s", msg.error())
             else:
                 topic = msg.topic()
                 raw   = msg.value()
