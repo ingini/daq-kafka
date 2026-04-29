@@ -1,0 +1,336 @@
+version: "3.9"
+
+# ============================================================
+#  Camera/IMU → Confluent Kafka → MinIO  Pipeline
+#  Platform : AP500L / Orin
+#  Cameras  : /dev/video0-2  (1920×1080, 20FPS → 1fps JPEG Q90 640×360)
+#  IMU/GNSS : BynavX1  UDP 192.168.20.50:1111
+# ============================================================
+
+networks:
+  daq-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  zk-data:
+  zk-log:
+  kafka-data:
+  minio-data:
+
+# ─────────────────────────────────────────────
+#  1. Confluent Platform  (Zookeeper + Broker + Schema Registry + Control Center)
+# ─────────────────────────────────────────────
+services:
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: zookeeper
+    restart: unless-stopped
+    networks:
+      - daq-net
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zk-data:/var/lib/zookeeper/data
+      - zk-log:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka-broker:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka-broker
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    networks:
+      - daq-net
+    ports:
+      - "9092:9092"       # internal clients (containers)
+      - "29092:29092"     # host access for debugging
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-broker:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # 카메라 JPEG 이미지 크기 여유 (640×360 Q90 ≈ 50~100KB)
+      KAFKA_MESSAGE_MAX_BYTES: 5242880         # 5 MB
+      KAFKA_REPLICA_FETCH_MAX_BYTES: 5242880
+      KAFKA_FETCH_MESSAGE_MAX_BYTES: 5242880
+      # 보존 정책 – 6시간 / 10GB per topic
+      KAFKA_LOG_RETENTION_HOURS: 6
+      KAFKA_LOG_RETENTION_BYTES: 10737418240
+      KAFKA_LOG_SEGMENT_BYTES: 536870912
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 30s
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    container_name: schema-registry
+    restart: unless-stopped
+    depends_on:
+      kafka-broker:
+        condition: service_healthy
+    networks:
+      - daq-net
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka-broker:9092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+
+  control-center:
+    image: confluentinc/cp-enterprise-control-center:7.6.1
+    container_name: control-center
+    restart: unless-stopped
+    depends_on:
+      - kafka-broker
+      - schema-registry
+    networks:
+      - daq-net
+    ports:
+      - "9021:9021"
+    environment:
+      CONTROL_CENTER_BOOTSTRAP_SERVERS: kafka-broker:9092
+      CONTROL_CENTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONTROL_CENTER_REPLICATION_FACTOR: 1
+      CONTROL_CENTER_INTERNAL_TOPICS_PARTITIONS: 1
+      CONTROL_CENTER_MONITORING_INTERCEPTOR_TOPIC_PARTITIONS: 1
+      CONFLUENT_METRICS_TOPIC_REPLICATION: 1
+      PORT: 9021
+
+  # Kafka topic 사전 생성 (카메라 3개 + IMU + GNSS)
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka-init
+    depends_on:
+      kafka-broker:
+        condition: service_healthy
+    networks:
+      - daq-net
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Waiting for Kafka to be fully ready..."
+        sleep 10
+        for TOPIC in sensor.cam0.jpeg sensor.cam1.jpeg sensor.cam2.jpeg sensor.imu sensor.gnss; do
+          kafka-topics --bootstrap-server kafka-broker:9092 \
+            --create --if-not-exists \
+            --topic $$TOPIC \
+            --partitions 1 \
+            --replication-factor 1 \
+            --config retention.ms=21600000 \
+            --config max.message.bytes=5242880
+          echo "Topic $$TOPIC created/verified."
+        done
+    restart: on-failure
+
+# ─────────────────────────────────────────────
+#  2. MinIO  (Object Storage)
+# ─────────────────────────────────────────────
+  minio:
+    image: minio/minio:RELEASE.2024-05-01T01-11-10Z
+    container_name: minio
+    restart: unless-stopped
+    networks:
+      - daq-net
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # MinIO bucket 초기화
+  minio-init:
+    image: minio/mc:RELEASE.2024-05-03T04-40-00Z
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - daq-net
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set local http://minio:9000 minioadmin minioadmin123
+        mc mb --ignore-existing local/daq-cam0
+        mc mb --ignore-existing local/daq-cam1
+        mc mb --ignore-existing local/daq-cam2
+        mc mb --ignore-existing local/daq-imu
+        mc mb --ignore-existing local/daq-gnss
+        echo "MinIO buckets initialized."
+    restart: on-failure
+
+# ─────────────────────────────────────────────
+#  3. Camera Producers  (cam0 / cam1 / cam2)
+#     V4L2 → JPEG 1fps 640×360 Q90 → Kafka
+# ─────────────────────────────────────────────
+  cam0-producer:
+    build:
+      context: ./producers/camera
+      dockerfile: Dockerfile
+    container_name: cam0-producer
+    restart: unless-stopped
+    depends_on:
+      kafka-broker:
+        condition: service_healthy
+    networks:
+      - daq-net
+    devices:
+      - /dev/video0:/dev/video0
+    environment:
+      KAFKA_BOOTSTRAP: kafka-broker:9092
+      KAFKA_TOPIC: sensor.cam0.jpeg
+      CAM_DEVICE: /dev/video0
+      CAP_WIDTH: 1920
+      CAP_HEIGHT: 1080
+      CAP_FPS: 20
+      OUT_WIDTH: 640
+      OUT_HEIGHT: 360
+      JPEG_QUALITY: 90
+      PUBLISH_FPS: 1       # Kafka publish 주기 (1fps)
+    group_add:
+      - video
+
+  cam1-producer:
+    build:
+      context: ./producers/camera
+      dockerfile: Dockerfile
+    container_name: cam1-producer
+    restart: unless-stopped
+    depends_on:
+      kafka-broker:
+        condition: service_healthy
+    networks:
+      - daq-net
+    devices:
+      - /dev/video1:/dev/video1
+    environment:
+      KAFKA_BOOTSTRAP: kafka-broker:9092
+      KAFKA_TOPIC: sensor.cam1.jpeg
+      CAM_DEVICE: /dev/video1
+      CAP_WIDTH: 1920
+      CAP_HEIGHT: 1080
+      CAP_FPS: 20
+      OUT_WIDTH: 640
+      OUT_HEIGHT: 360
+      JPEG_QUALITY: 90
+      PUBLISH_FPS: 1
+    group_add:
+      - video
+
+  cam2-producer:
+    build:
+      context: ./producers/camera
+      dockerfile: Dockerfile
+    container_name: cam2-producer
+    restart: unless-stopped
+    depends_on:
+      kafka-broker:
+        condition: service_healthy
+    networks:
+      - daq-net
+    devices:
+      - /dev/video2:/dev/video2
+    environment:
+      KAFKA_BOOTSTRAP: kafka-broker:9092
+      KAFKA_TOPIC: sensor.cam2.jpeg
+      CAM_DEVICE: /dev/video2
+      CAP_WIDTH: 1920
+      CAP_HEIGHT: 1080
+      CAP_FPS: 20
+      OUT_WIDTH: 640
+      OUT_HEIGHT: 360
+      JPEG_QUALITY: 90
+      PUBLISH_FPS: 1
+    group_add:
+      - video
+
+# ─────────────────────────────────────────────
+#  4. IMU Producer  (BynavX1 UDP → Kafka)
+#     topics: sensor.imu  /  sensor.gnss
+# ─────────────────────────────────────────────
+  imu-producer:
+    build:
+      context: ./producers/imu
+      dockerfile: Dockerfile
+    container_name: imu-producer
+    restart: unless-stopped
+    depends_on:
+      kafka-broker:
+        condition: service_healthy
+    networks:
+      - daq-net
+    network_mode: host          # UDP 수신을 위해 host 네트워크 사용
+    environment:
+      KAFKA_BOOTSTRAP: "127.0.0.1:29092"   # host network이므로 localhost 사용
+      KAFKA_TOPIC_IMU: sensor.imu
+      KAFKA_TOPIC_GNSS: sensor.gnss
+      IMU_SRC_IP: 192.168.20.50
+      IMU_DST_PORT: 1111
+      IMU_PROTOCOL: UDP
+
+# ─────────────────────────────────────────────
+#  5. MinIO Consumer  (Kafka → MinIO S3)
+#     cam0/cam1/cam2/imu/gnss 토픽 모두 소비
+# ─────────────────────────────────────────────
+  minio-consumer:
+    build:
+      context: ./consumers/minio
+      dockerfile: Dockerfile
+    container_name: minio-consumer
+    restart: unless-stopped
+    depends_on:
+      kafka-broker:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - daq-net
+    environment:
+      KAFKA_BOOTSTRAP: kafka-broker:9092
+      KAFKA_GROUP_ID: minio-consumer-group
+      KAFKA_TOPICS: sensor.cam0.jpeg,sensor.cam1.jpeg,sensor.cam2.jpeg,sensor.imu,sensor.gnss
+      KAFKA_AUTO_OFFSET_RESET: earliest
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin123
+      # 버킷 라우팅 규칙  topic → bucket 매핑 (JSON)
+      TOPIC_BUCKET_MAP: >
+        {
+          "sensor.cam0.jpeg": "daq-cam0",
+          "sensor.cam1.jpeg": "daq-cam1",
+          "sensor.cam2.jpeg": "daq-cam2",
+          "sensor.imu":       "daq-imu",
+          "sensor.gnss":      "daq-gnss"
+        }
+      # 오브젝트 경로 패턴:  {date}/{hour}/{timestamp}.{ext}
+      OBJECT_PATH_PATTERN: "{date}/{hour}/{timestamp}.{ext}"
+      BATCH_SIZE: 100       # 100메시지마다 flush
+      FLUSH_INTERVAL: 5     # 또는 5초마다 flush
