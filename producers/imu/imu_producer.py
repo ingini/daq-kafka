@@ -1,8 +1,8 @@
 # ============================================================
 #  producers/imu/imu_producer.py
-#  BynavX1 UDP → Confluent Kafka
+#  NOVATEL UDP → Confluent Kafka
 #
-#  BynavX1 이 전송하는 Bynav 바이너리 프레임을 파싱해
+#  NOVATEL 이 전송하는 NOVATEL 바이너리 프레임을 파싱해
 #  IMU topic 과 GNSS topic 으로 분리 발행.
 #
 #  env:
@@ -31,13 +31,13 @@ TOPIC_GNSS       = os.environ.get("KAFKA_TOPIC_GNSS", "sensor.gnss")
 IMU_SRC_IP       = os.environ.get("IMU_SRC_IP",  "192.168.20.50")
 IMU_DST_PORT     = int(os.environ.get("IMU_DST_PORT", "1111"))
 
-# BynavX1 Binary Protocol 상수
-BYNAV_SYNC0 = 0xAA
-BYNAV_SYNC1 = 0x44
-BYNAV_SYNC2 = 0x13
-HEADER_LEN  = 28      # Short header 기준 (Bynav OEM binary)
+# NOVATEL Binary Protocol 상수
+NOVATEL_SYNC0 = 0xAA
+NOVATEL_SYNC1 = 0x44
+NOVATEL_SYNC2 = 0x12
+HEADER_LEN  = 28      # Short header 기준 (NOVATEL OEM binary)
 
-# Message ID (Bynav 기준, 실제 장비 firmware 에 맞게 조정)
+# Message ID (NOVATEL 기준, 실제 장비 firmware 에 맞게 조정)
 MSG_RAWIMUX   = 268   # Raw IMU data
 MSG_INSPVAXB  = 1465  # INS Position Velocity Attitude extended
 MSG_BESTGNSSPOS = 1429  # Best available GNSS position
@@ -57,10 +57,10 @@ def build_producer() -> Producer:
     })
 
 
-# ── Bynav Binary 파서 ─────────────────────────────────────
-def parse_bynav_frame(data: bytes) -> dict | None:
+# ── NOVATEL Binary 파서 ─────────────────────────────────────
+def parse_NOVATEL_frame(data: bytes) -> dict | None:
     """
-    Bynav OEM Short Binary Header (28 bytes) + payload 파싱.
+    NOVATEL OEM Short Binary Header (28 bytes) + payload 파싱.
     sync(3B) + header_len(1B) + msg_len(2B) + msg_id(2B) +
     msg_type(1B) + port_addr(1B) + seq(2B) + idle_time(1B) +
     time_status(1B) + week(2B) + ms(4B) + rx_status(4B) +
@@ -68,7 +68,7 @@ def parse_bynav_frame(data: bytes) -> dict | None:
     """
     if len(data) < HEADER_LEN:
         return None
-    if data[0] != BYNAV_SYNC0 or data[1] != BYNAV_SYNC1 or data[2] != BYNAV_SYNC2:
+    if data[0] != NOVATEL_SYNC0 or data[1] != NOVATEL_SYNC1 or data[2] != NOVATEL_SYNC2:
         return None
 
     hdr_len, msg_len, msg_id = struct.unpack_from("<BBHH", data, 3)
@@ -186,7 +186,7 @@ def main():
             if addr[0] != IMU_SRC_IP:
                 continue
 
-            frame = parse_bynav_frame(raw)
+            frame = parse_NOVATEL_frame(raw)
             if frame is None:
                 err_count += 1
                 if err_count % 100 == 0:
