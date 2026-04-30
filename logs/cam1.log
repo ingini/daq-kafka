@@ -1,0 +1,39 @@
+[sensor.cam1.jpeg] starting pipe /dev/video1 → Kafka
+2026-04-29 23:46:06,426 [cam-producer] INFO: Starting  topic=sensor.cam1.jpeg  device=/dev/video1
+2026-04-29 23:46:07,551 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40265 B count=1
+2026-04-29 23:46:09,551 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40160 B count=2
+2026-04-29 23:46:11,582 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40022 B count=3
+2026-04-29 23:46:13,582 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40176 B count=4
+2026-04-29 23:46:15,582 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40234 B count=5
+2026-04-29 23:46:17,581 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40126 B count=6
+2026-04-29 23:46:19,581 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40155 B count=7
+2026-04-29 23:46:21,581 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40081 B count=8
+2026-04-29 23:46:23,580 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40143 B count=9
+2026-04-29 23:46:25,581 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40114 B count=10
+2026-04-29 23:46:27,580 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40028 B count=11
+2026-04-29 23:46:29,580 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40081 B count=12
+2026-04-29 23:46:31,579 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40145 B count=13
+2026-04-29 23:46:33,579 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40115 B count=14
+2026-04-29 23:46:35,578 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40092 B count=15
+2026-04-29 23:46:37,578 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40128 B count=16
+2026-04-29 23:46:39,578 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40057 B count=17
+2026-04-29 23:46:41,577 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=39977 B count=18
+2026-04-29 23:46:43,577 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40137 B count=19
+2026-04-29 23:46:45,577 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40142 B count=20
+2026-04-29 23:46:47,577 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40115 B count=21
+2026-04-29 23:46:49,576 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40082 B count=22
+2026-04-29 23:46:51,576 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40134 B count=23
+2026-04-29 23:46:53,576 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40188 B count=24
+2026-04-29 23:46:55,575 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40205 B count=25
+2026-04-29 23:46:57,575 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40153 B count=26
+2026-04-29 23:46:59,574 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40173 B count=27
+2026-04-29 23:47:01,574 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40258 B count=28
+2026-04-29 23:47:03,574 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40204 B count=29
+2026-04-29 23:47:05,573 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40190 B count=30
+2026-04-29 23:47:07,574 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40069 B count=31
+2026-04-29 23:47:09,573 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40202 B count=32
+2026-04-29 23:47:11,572 [cam-producer] INFO: Produced topic=sensor.cam1.jpeg size=40158 B count=33
+2026-04-29 23:47:13,528 [cam-producer] INFO: Done. total=33
+Traceback (most recent call last):
+  File "<string>", line 16, in <module>
+KeyboardInterrupt
