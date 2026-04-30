@@ -320,3 +320,7 @@ docker compose down -v
 ## Camera capture 과정
 <img width="1358" height="838" alt="image" src="https://github.com/user-attachments/assets/20037cc5-7b78-42f6-826e-625322a9e8c4" />
 
+<img width="1358" height="598" alt="image" src="https://github.com/user-attachments/assets/e6a6d787-3278-4c9d-8e09-de76a9f64b53" />
+
+<img width="1358" height="758" alt="image" src="https://github.com/user-attachments/assets/d074efd9-2fbe-4f27-99dd-7a2054937254" />
+
