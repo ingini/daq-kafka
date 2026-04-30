@@ -1,3 +1,5 @@
+version: "3.9"
+
 # ============================================================
 #  Camera/IMU → Confluent Kafka → MinIO  Pipeline
 #  Platform : AP500L / Orin
@@ -177,12 +179,8 @@ services:
     command:
       - |
         mc alias set local http://minio:9000 minioadmin minioadmin123
-        mc mb --ignore-existing local/daq-cam0
-        mc mb --ignore-existing local/daq-cam1
-        mc mb --ignore-existing local/daq-cam2
-        mc mb --ignore-existing local/daq-imu
-        mc mb --ignore-existing local/daq-gnss
-        echo "MinIO buckets initialized."
+        mc mb --ignore-existing local/DAQ
+        echo "MinIO bucket DAQ initialized."
     restart: on-failure
 
 # ─────────────────────────────────────────────
@@ -299,18 +297,20 @@ services:
       MINIO_ENDPOINT: http://minio:9000
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin123
-      # 버킷 라우팅 규칙  topic → bucket 매핑 (JSON)
-      TOPIC_BUCKET_MAP: >
+      # 단일 버킷 + 차량번호
+      MINIO_BUCKET: DAQ
+      VEHICLE_ID: KOR-1234             # config.env 의 VEHICLE_ID 와 동일하게 설정
+      # topic → sensor 폴더명 매핑 (JSON)
+      TOPIC_SENSOR_MAP: >
         {
-          "sensor.cam0.jpeg": "daq-cam0",
-          "sensor.cam1.jpeg": "daq-cam1",
-          "sensor.cam2.jpeg": "daq-cam2",
-          "sensor.imu":       "daq-imu",
-          "sensor.gnss":      "daq-gnss"
+          "sensor.cam0.jpeg": "cam0",
+          "sensor.cam1.jpeg": "cam1",
+          "sensor.cam2.jpeg": "cam2",
+          "sensor.imu":       "imu",
+          "sensor.gnss":      "gnss"
         }
-      # 오브젝트 경로 패턴:  {date}/{hour}/{timestamp}.{ext}
-      OBJECT_PATH_PATTERN: "{date}/{hour}/{timestamp}.{ext}"
-      BATCH_SIZE: 100       # 100메시지마다 flush
+      # 경로: DAQ/{year}/{month}/{day}/{hour}/{vehicle_id}/{sensor}/{timestamp}.{ext}
+      BATCH_SIZE: 100
       FLUSH_INTERVAL: 5
       IMU_STORAGE_FORMAT: parquet
       IMU_PARQUET_BATCH: 1000
