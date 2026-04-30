@@ -1,5 +1,3 @@
-version: "3.9"
-
 # ============================================================
 #  Camera/IMU → Confluent Kafka → MinIO  Pipeline
 #  Platform : AP500L / Orin
@@ -313,4 +311,6 @@ services:
       # 오브젝트 경로 패턴:  {date}/{hour}/{timestamp}.{ext}
       OBJECT_PATH_PATTERN: "{date}/{hour}/{timestamp}.{ext}"
       BATCH_SIZE: 100       # 100메시지마다 flush
-      FLUSH_INTERVAL: 5     # 또는 5초마다 flush
+      FLUSH_INTERVAL: 5
+      IMU_STORAGE_FORMAT: parquet
+      IMU_PARQUET_BATCH: 1000
