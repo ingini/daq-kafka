@@ -1,93 +1,84 @@
 # ============================================================
 #  consumers/minio/minio_consumer.py
-#  Confluent Kafka → MinIO S3 Object Storage
+#  Confluent Kafka → MinIO
 #
-#  - cam topic  : binary [8B ts_ns][4B len][JPEG bytes] → .jpg
-#  - imu/gnss   : JSON  → .json
-#  - 오브젝트 경로 패턴:  {date}/{hour}/{timestamp}.{ext}
+#  - Camera (binary JPEG) → .jpg
+#  - IMU/GNSS (JSON)      → .parquet  (IMU_STORAGE_FORMAT=parquet)
+#                         → .json     (IMU_STORAGE_FORMAT=json)
 #
-#  env:
-#    KAFKA_BOOTSTRAP, KAFKA_GROUP_ID
-#    KAFKA_TOPICS  (comma-separated)
-#    KAFKA_AUTO_OFFSET_RESET
-#    MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY
-#    TOPIC_BUCKET_MAP  (JSON string)
-#    OBJECT_PATH_PATTERN
-#    BATCH_SIZE, FLUSH_INTERVAL
+#  Parquet 이점:
+#    JSON  : 1000 rows ≈ 150~200 KB (텍스트 반복, 키 중복)
+#    Parquet: 1000 rows ≈  15~25 KB (컬럼 압축, snappy)
+#    → 약 8~10배 용량 절감, pandas/DuckDB/Spark 직접 쿼리 가능
 # ============================================================
 
-import os
-import json
-import struct
-import time
-import logging
+import os, json, struct, time, logging, io
 from datetime import datetime, timezone
-from io import BytesIO
-
 from confluent_kafka import Consumer, KafkaException, KafkaError
 from minio import Minio
 from minio.error import S3Error
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s"
-)
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s [minio-consumer] %(levelname)s: %(message)s")
 log = logging.getLogger("minio-consumer")
 
 # ── 환경변수 ─────────────────────────────────────────────────
-KAFKA_BOOTSTRAP        = os.environ["KAFKA_BOOTSTRAP"]
-KAFKA_GROUP_ID         = os.environ.get("KAFKA_GROUP_ID", "minio-consumer-group")
-KAFKA_TOPICS           = os.environ["KAFKA_TOPICS"].split(",")
+KAFKA_BOOTSTRAP         = os.environ["KAFKA_BOOTSTRAP"]
+KAFKA_GROUP_ID          = os.environ.get("KAFKA_GROUP_ID", "minio-consumer-group")
+KAFKA_TOPICS            = os.environ["KAFKA_TOPICS"].split(",")
 KAFKA_AUTO_OFFSET_RESET = os.environ.get("KAFKA_AUTO_OFFSET_RESET", "earliest")
 
-MINIO_ENDPOINT  = os.environ["MINIO_ENDPOINT"].replace("http://", "").replace("https://", "")
+MINIO_ENDPOINT   = os.environ["MINIO_ENDPOINT"].replace("http://","").replace("https://","")
 MINIO_ACCESS_KEY = os.environ["MINIO_ACCESS_KEY"]
 MINIO_SECRET_KEY = os.environ["MINIO_SECRET_KEY"]
-MINIO_SECURE    = os.environ.get("MINIO_ENDPOINT", "").startswith("https")
+MINIO_SECURE     = os.environ.get("MINIO_ENDPOINT","").startswith("https")
 
-TOPIC_BUCKET_MAP: dict[str, str] = json.loads(os.environ["TOPIC_BUCKET_MAP"])
-OBJECT_PATH_PATTERN = os.environ.get("OBJECT_PATH_PATTERN", "{date}/{hour}/{timestamp}.{ext}")
+TOPIC_BUCKET_MAP: dict = json.loads(os.environ["TOPIC_BUCKET_MAP"])
+OBJECT_PATH_PATTERN     = os.environ.get("OBJECT_PATH_PATTERN", "{date}/{hour}/{timestamp}.{ext}")
 
-BATCH_SIZE     = int(os.environ.get("BATCH_SIZE",     "100"))
-FLUSH_INTERVAL = int(os.environ.get("FLUSH_INTERVAL", "5"))
+BATCH_SIZE      = int(os.environ.get("BATCH_SIZE",     "100"))
+FLUSH_INTERVAL  = int(os.environ.get("FLUSH_INTERVAL", "5"))
+
+# IMU/GNSS 저장 포맷: parquet | json
+IMU_STORAGE_FORMAT  = os.environ.get("IMU_STORAGE_FORMAT", "parquet").lower()
+IMU_PARQUET_BATCH   = int(os.environ.get("IMU_PARQUET_BATCH", "1000"))
+
+# ── Parquet 가용성 확인 ───────────────────────────────────────
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    PARQUET_AVAILABLE = True
+except ImportError:
+    PARQUET_AVAILABLE = False
+    log.warning("pyarrow not installed — falling back to JSON for IMU/GNSS")
+
+USE_PARQUET = (IMU_STORAGE_FORMAT == "parquet") and PARQUET_AVAILABLE
 
 
-# ── 오브젝트 경로 생성 ─────────────────────────────────────────
 def make_object_path(topic: str, ts_ns: int, ext: str) -> str:
     ts = datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc)
     return OBJECT_PATH_PATTERN.format(
         date=ts.strftime("%Y-%m-%d"),
         hour=ts.strftime("%H"),
         timestamp=f"{ts.strftime('%Y%m%dT%H%M%S%f')}_{ts_ns}",
-        ext=ext,
-        topic=topic.replace(".", "_"),
+        ext=ext, topic=topic.replace(".","_"),
     )
 
 
-# ── Payload 파서 ──────────────────────────────────────────────
-def decode_camera_message(raw: bytes) -> tuple[bytes, int]:
-    """Binary: [8B ts_ns][4B payload_len][JPEG bytes]"""
+def decode_camera(raw: bytes) -> tuple[bytes, int]:
     if len(raw) < 12:
-        raise ValueError("Camera message too short")
-    ts_ns, payload_len = struct.unpack_from(">QI", raw, 0)
-    jpeg_bytes = raw[12: 12 + payload_len]
-    return jpeg_bytes, ts_ns
+        raise ValueError("too short")
+    ts_ns, plen = struct.unpack_from(">QI", raw, 0)
+    return raw[12:12+plen], ts_ns
 
 
 def is_camera_topic(topic: str) -> bool:
     return "cam" in topic.lower()
 
 
-# ── MinIO 클라이언트 ──────────────────────────────────────────
-def build_minio_client() -> Minio:
-    log.info("Connecting MinIO  endpoint=%s  secure=%s", MINIO_ENDPOINT, MINIO_SECURE)
-    client = Minio(
-        MINIO_ENDPOINT,
-        access_key=MINIO_ACCESS_KEY,
-        secret_key=MINIO_SECRET_KEY,
-        secure=MINIO_SECURE,
-    )
-    # 버킷 존재 확인
+def build_minio() -> Minio:
+    client = Minio(MINIO_ENDPOINT, access_key=MINIO_ACCESS_KEY,
+                   secret_key=MINIO_SECRET_KEY, secure=MINIO_SECURE)
     for bucket in set(TOPIC_BUCKET_MAP.values()):
         if not client.bucket_exists(bucket):
             client.make_bucket(bucket)
@@ -95,35 +86,54 @@ def build_minio_client() -> Minio:
     return client
 
 
-# ── Kafka Consumer ──────────────────────────────────────────
 def build_consumer() -> Consumer:
-    conf = {
+    c = Consumer({
         "bootstrap.servers": KAFKA_BOOTSTRAP,
         "group.id": KAFKA_GROUP_ID,
         "auto.offset.reset": KAFKA_AUTO_OFFSET_RESET,
-        "enable.auto.commit": False,        # 수동 커밋 (MinIO 저장 후 커밋)
-        "fetch.max.bytes": 52_428_800,      # 50 MB
+        "enable.auto.commit": False,
+        "fetch.max.bytes": 52_428_800,
         "max.partition.fetch.bytes": 5_242_880,
-        "session.timeout.ms": 30_000,
-        "heartbeat.interval.ms": 10_000,
-    }
-    c = Consumer(conf)
+    })
     c.subscribe(KAFKA_TOPICS)
     log.info("Subscribed topics: %s", KAFKA_TOPICS)
     return c
 
 
-# ── 메인 루프 ─────────────────────────────────────────────────
+def flush_parquet(rows: list[dict], bucket: str, topic: str,
+                  minio_cli: Minio) -> int:
+    """IMU/GNSS rows → Parquet → MinIO"""
+    if not rows:
+        return 0
+    try:
+        table = pa.Table.from_pylist(rows)
+        buf = io.BytesIO()
+        pq.write_table(table, buf, compression="snappy")
+        buf.seek(0)
+        ts_ns = rows[0].get("ts_ns", time.time_ns())
+        obj_path = make_object_path(topic, ts_ns, "parquet")
+        data = buf.getvalue()
+        minio_cli.put_object(bucket, obj_path, io.BytesIO(data), len(data),
+                             content_type="application/octet-stream")
+        log.info("Parquet flush  bucket=%s  rows=%d  size=%d B  path=%s",
+                 bucket, len(rows), len(data), obj_path)
+        return 1
+    except Exception as e:
+        log.error("Parquet flush error: %s", e)
+        return 0
+
+
 def main():
     consumer  = build_consumer()
-    minio_cli = build_minio_client()
+    minio_cli = build_minio()
 
-    pending   = []          # (bucket, object_path, data_bytes, content_type)
-    last_flush = time.monotonic()
-    total_saved = 0
+    pending_cam  = []  # (bucket, obj_path, bytes, content_type)
+    pending_imu  = {}  # topic → list[dict]  (parquet 누적)
+    last_flush   = time.monotonic()
+    total_saved  = 0
 
-    log.info("Consumer loop started  batch=%d  flush_interval=%ds",
-             BATCH_SIZE, FLUSH_INTERVAL)
+    log.info("Consumer loop started  batch=%d  flush_interval=%ds  imu_format=%s",
+             BATCH_SIZE, FLUSH_INTERVAL, "parquet" if USE_PARQUET else "json")
 
     try:
         while True:
@@ -132,70 +142,85 @@ def main():
             if msg is None:
                 pass
             elif msg.error():
-                if msg.error().code() == KafkaError._PARTITION_EOF:
-                    log.debug("EOF partition %d", msg.partition())
-                elif msg.error().code() == KafkaError.UNKNOWN_TOPIC_OR_PART:
-                    # kafka-init 토픽 생성 전에 뜬 경우 – 크래시 없이 대기
-                    log.warning("Topic not ready yet, waiting... (%s)", msg.error())
+                code = msg.error().code()
+                if code == KafkaError._PARTITION_EOF:
+                    pass
+                elif code == KafkaError.UNKNOWN_TOPIC_OR_PART:
+                    log.warning("Topic not ready yet: %s", msg.error())
                     time.sleep(2)
                 else:
                     log.error("Kafka error: %s", msg.error())
             else:
-                topic = msg.topic()
-                raw   = msg.value()
+                topic  = msg.topic()
+                raw    = msg.value()
                 bucket = TOPIC_BUCKET_MAP.get(topic)
-
                 if bucket is None:
-                    log.warning("Unknown topic: %s", topic)
-                else:
-                    try:
-                        if is_camera_topic(topic):
-                            jpeg_bytes, ts_ns = decode_camera_message(raw)
-                            obj_path = make_object_path(topic, ts_ns, "jpg")
-                            pending.append((bucket, obj_path, jpeg_bytes, "image/jpeg"))
-                        else:
-                            # IMU / GNSS: JSON 그대로 저장
-                            payload = json.loads(raw.decode())
-                            ts_ns = payload.get("ts_ns", time.time_ns())
-                            obj_path = make_object_path(topic, ts_ns, "json")
-                            json_bytes = json.dumps(payload, ensure_ascii=False).encode()
-                            pending.append((bucket, obj_path, json_bytes, "application/json"))
-                    except Exception as e:
-                        log.error("Decode error topic=%s: %s", topic, e)
+                    continue
 
-            # ── flush 조건: 배치 사이즈 or 시간 초과 ──────────
+                try:
+                    if is_camera_topic(topic):
+                        jpeg, ts_ns = decode_camera(raw)
+                        obj_path = make_object_path(topic, ts_ns, "jpg")
+                        pending_cam.append((bucket, obj_path, jpeg, "image/jpeg"))
+                    else:
+                        payload = json.loads(raw.decode())
+                        ts_ns = payload.get("ts_ns", time.time_ns())
+
+                        if USE_PARQUET:
+                            if topic not in pending_imu:
+                                pending_imu[topic] = []
+                            pending_imu[topic].append(payload)
+                        else:
+                            obj_path = make_object_path(topic, ts_ns, "json")
+                            pending_cam.append((bucket, obj_path,
+                                json.dumps(payload).encode(), "application/json"))
+                except Exception as e:
+                    log.error("Decode error topic=%s: %s", topic, e)
+
             now = time.monotonic()
-            if len(pending) >= BATCH_SIZE or (pending and now - last_flush >= FLUSH_INTERVAL):
+            cam_full    = len(pending_cam) >= BATCH_SIZE
+            imu_full    = USE_PARQUET and any(
+                len(v) >= IMU_PARQUET_BATCH for v in pending_imu.values())
+            time_up     = (pending_cam or pending_imu) and (now - last_flush >= FLUSH_INTERVAL)
+
+            if cam_full or imu_full or time_up:
                 saved = 0
-                for (bucket, obj_path, data, content_type) in pending:
+                # Camera JPEG flush
+                for (bkt, path, data, ctype) in pending_cam:
                     try:
-                        minio_cli.put_object(
-                            bucket,
-                            obj_path,
-                            data=BytesIO(data),
-                            length=len(data),
-                            content_type=content_type,
-                        )
+                        minio_cli.put_object(bkt, path, io.BytesIO(data), len(data),
+                                             content_type=ctype)
                         saved += 1
                     except S3Error as e:
-                        log.error("MinIO put_object failed: %s", e)
+                        log.error("MinIO error: %s", e)
+
+                # IMU Parquet flush
+                for topic_key, rows in list(pending_imu.items()):
+                    if rows:
+                        bkt = TOPIC_BUCKET_MAP.get(topic_key, "daq-imu")
+                        saved += flush_parquet(rows, bkt, topic_key, minio_cli)
+                        pending_imu[topic_key] = []
 
                 consumer.commit(asynchronous=False)
                 total_saved += saved
                 log.info("Flushed %d objects  total=%d", saved, total_saved)
-                pending.clear()
+                pending_cam.clear()
                 last_flush = time.monotonic()
 
     except KeyboardInterrupt:
-        log.info("Interrupted – flushing remaining %d items…", len(pending))
-        for (bucket, obj_path, data, content_type) in pending:
-            try:
-                minio_cli.put_object(bucket, obj_path, BytesIO(data), len(data),
-                                     content_type=content_type)
-            except Exception as e:
-                log.error("Final flush error: %s", e)
-        consumer.commit(asynchronous=False)
+        pass
     finally:
+        # 남은 데이터 flush
+        for (bkt, path, data, ctype) in pending_cam:
+            try:
+                minio_cli.put_object(bkt, path, io.BytesIO(data), len(data),
+                                     content_type=ctype)
+            except Exception: pass
+        for topic_key, rows in pending_imu.items():
+            if rows:
+                bkt = TOPIC_BUCKET_MAP.get(topic_key, "daq-imu")
+                flush_parquet(rows, bkt, topic_key, minio_cli)
+        consumer.commit(asynchronous=False)
         consumer.close()
         log.info("Consumer closed.  total_saved=%d", total_saved)
 
