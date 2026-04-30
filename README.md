@@ -314,3 +314,9 @@ docker compose down -v
 | `group_add: video` 컨테이너 오류 | python:slim 내부에 video 그룹 없음 | GID `"44"` 숫자로 지정 |
 | cam-producer `numpy _ARRAY_API not found` | OpenCV가 NumPy 1.x 기준 컴파일 | `requirements.txt` 에 `numpy<2` 핀 추가 |
 | BynavX1 MSG_ID 불일치 | 펌웨어 버전마다 ID 다름 | `imu_producer.py` 상수 확인 후 수정 |
+
+---
+
+## Camera capture 과정
+<img width="1358" height="838" alt="image" src="https://github.com/user-attachments/assets/20037cc5-7b78-42f6-826e-625322a9e8c4" />
+
