@@ -10,7 +10,8 @@ Camera(V4L2/Tegra) / IMU(BynavX1) → Confluent Kafka → MinIO S3
 
 ## 아키텍처
 
-<img width="1358" height="1158" alt="image" src="https://github.com/user-attachments/assets/359c6ada-9197-4db5-b666-bc8215b6b0c3" />
+<img width="1358" height="1198" alt="image" src="https://github.com/user-attachments/assets/54c5c04c-3899-4e3d-ba06-0254f18cb994" />
+
 
 
 > **카메라는 호스트에서 직접 실행합니다.**
