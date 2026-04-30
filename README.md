@@ -2,43 +2,45 @@
 
 Camera(V4L2/Tegra) / IMU(BynavX1) → Confluent Kafka → MinIO S3
 
-**Platform:** AP500L / NVIDIA Orin (aarch64, Tegra ISP 카메라)
-**Cameras:** `/dev/video0~2` (gw5300, UYVY) — 1920×1080 20fps 캡처 → 1fps JPEG Q90 640×360 Kafka 발행
-**IMU/GNSS:** BynavX1 UDP `192.168.20.50:1111`
+**Platform:** AP500L / NVIDIA Orin (aarch64, Tegra ISP)
+**Cameras:** `/dev/video0~2` (gw5300, UYVY) — 1920×1080 20fps → 1fps JPEG 640×360 Kafka 발행
+**IMU/GNSS:** BynavX1 UDP `192.168.20.50:1111` → Parquet 저장
 
 ---
 
 ## 아키텍처
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  HOST (Tegra Orin)                                          │
-│                                                             │
-│  start_cameras.sh                                           │
-│  ┌──────────┐   ┌──────────┐   ┌─────────────────────┐      │
-│  │gst-launch│──▶│  framer  │──▶│  cam_producer.py  │      │
-│  │/dev/video│   │(4B hdr)  │   │  (confluent-kafka)  │──┐  │
-│  └──────────┘   └──────────┘   └─────────────────────┘  │  │
-│                                                         │  │
-│  ┌──────────────────────────────────────────────────┐   │  │
-│  │  Docker Compose (daq-net)                        │   │  │
-│  │                                                  │   │  │
-│  │  imu-producer ──────────────────────────────┐    │   │  │
-│  │  (BynavX1 UDP:1111)                         │    │   │  │
-│  │                                             ▼    ▼   │  │
-│  │  zookeeper ── kafka-broker ── schema-registry        │  │
-│  │                   │                                  │  │
-│  │                   ▼                                  │  │
-│  │  minio-consumer ──────────────▶ MinIO               │  │
-│  │                                (9000/9001)           │  │
-│  │  control-center (9021)                               │  │
-│  └──────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  HOST (Tegra Orin)                                               │
+│                                                                  │
+│  start_cameras.sh  ← config.env 설정 로드                        │
+│  ┌────────────┐  ┌──────────┐  ┌──────────────────────┐         │
+│  │ gst-launch │─▶│  framer  │─▶│   cam_producer.py    │         │
+│  │/dev/video* │  │ 4B 헤더  │  │  (confluent-kafka)   │──┐      │
+│  │UYVY→JPEG   │  │SOI/EOI   │  │  640×360 Q90 1fps    │  │      │
+│  └────────────┘  └──────────┘  └──────────────────────┘  │      │
+│                                                           │      │
+│  ┌────────────────────────────────────────────────────┐  │      │
+│  │  Docker Compose  (daq-net: 172.28.0.0/24)          │  │      │
+│  │                                                    │  │      │
+│  │  imu-producer ──────────────────────────────────┐  │  │      │
+│  │  BynavX1 UDP :1111                              │  │  │      │
+│  │                                                 ▼  ▼  │      │
+│  │  zookeeper ─── kafka-broker ─── schema-registry        │      │
+│  │                     │                                  │      │
+│  │                     ▼                                  │      │
+│  │  minio-consumer ─────────────▶ MinIO (:9000)           │      │
+│  │  JPEG→.jpg / JSON→.parquet     Console (:9001)         │      │
+│  │                                                        │      │
+│  │  control-center (:9021)  Kafka UI                      │      │
+│  └────────────────────────────────────────────────────────┘      │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-> **카메라 수집은 호스트에서 직접 실행합니다.**
-> gw5300은 Tegra ISP 전용 카메라라 Docker 컨테이너 안에서 GStreamer를 사용할 수 없습니다.
-> `start_cameras.sh` 가 호스트 GStreamer로 캡처하여 직접 Kafka로 produce합니다.
+> **카메라는 호스트에서 직접 실행합니다.**
+> gw5300은 Tegra ISP 전용 카메라로 Docker 컨테이너 내 GStreamer 플러그인 스캐너와 충돌합니다.
+> `start_cameras.sh` 가 호스트 GStreamer로 캡처 → Python이 직접 Kafka로 produce합니다.
 
 ---
 
@@ -46,10 +48,11 @@ Camera(V4L2/Tegra) / IMU(BynavX1) → Confluent Kafka → MinIO S3
 
 ```
 daq-kafka/
-├── docker-compose.yml       ← 인프라 + IMU + MinIO Consumer
-├── start_cameras.sh         ← 호스트에서 직접 실행 (카메라 → Kafka)
+├── config.env               ← 모든 설정값 (IP, 포트, 해상도 등)
+├── docker-compose.yml
+├── start_cameras.sh         ← 호스트 직접 실행 (카메라 → Kafka)
 ├── README.md
-├── logs/                    ← start_cameras.sh 실행 로그 (자동 생성)
+├── logs/                    ← 자동 생성, 3일 경과 로그 자동 삭제
 │   ├── cam0.log
 │   ├── cam1.log
 │   └── cam2.log
@@ -57,7 +60,7 @@ daq-kafka/
 │   ├── camera/
 │   │   ├── Dockerfile       ← 현재 미사용 (호스트 직접 실행)
 │   │   ├── requirements.txt
-│   │   └── cam_producer.py  ← start_cameras.sh 에서 호출
+│   │   └── cam_producer.py  ← start_cameras.sh 내부에서 호출
 │   └── imu/
 │       ├── Dockerfile
 │       ├── requirements.txt
@@ -65,8 +68,8 @@ daq-kafka/
 └── consumers/
     └── minio/
         ├── Dockerfile
-        ├── requirements.txt
-        └── minio_consumer.py
+        ├── requirements.txt  ← pyarrow 포함
+        └── minio_consumer.py ← JPEG→jpg / IMU→parquet
 ```
 
 ---
@@ -92,19 +95,45 @@ daq-kafka/
 | 프로세스 | 실행 방식 | 역할 |
 |---|---|---|
 | start_cameras.sh | `./start_cameras.sh` | gst-launch + cam_producer.py × 3 |
-| cam_producer.py | start_cameras.sh 내부에서 호출 | JPEG stdin → `sensor.camN.jpeg` |
+| cam_producer.py | start_cameras.sh 내부 호출 | JPEG stdin → `sensor.camN.jpeg` |
+
+---
+
+## 설정 관리 (config.env)
+
+모든 설정은 `config.env` 한 파일에서 관리합니다.
+`start_cameras.sh` 는 실행 시 자동으로 `source config.env` 합니다.
+
+```bash
+# 주요 설정 항목
+KAFKA_HOST=localhost
+KAFKA_PORT=29092              # 호스트 → Kafka (start_cameras.sh)
+
+IMU_SRC_IP=192.168.20.50
+IMU_DST_PORT=1111
+
+CAP_WIDTH=1920   CAP_HEIGHT=1080   CAP_FPS=20
+OUT_WIDTH=640    OUT_HEIGHT=360
+JPEG_QUALITY=90
+PUBLISH_FPS=1
+
+IMU_STORAGE_FORMAT=parquet    # parquet | json
+IMU_PARQUET_BATCH=1000        # N rows 누적 후 1 Parquet 파일
+
+LOG_RETENTION_DAYS=3          # 3일 경과 로그 자동 삭제
+```
 
 ---
 
 ## Kafka Topic 설계
 
-| Topic | 데이터 타입 | MinIO Bucket | 보존 |
-|---|---|---|---|
-| sensor.cam0.jpeg | Binary (JPEG) | daq-cam0 | 6시간 / 10GB |
-| sensor.cam1.jpeg | Binary (JPEG) | daq-cam1 | 6시간 / 10GB |
-| sensor.cam2.jpeg | Binary (JPEG) | daq-cam2 | 6시간 / 10GB |
-| sensor.imu | JSON | daq-imu | 6시간 / 10GB |
-| sensor.gnss | JSON | daq-gnss | 6시간 / 10GB |
+| Topic | 데이터 타입 | MinIO Bucket | 파일 포맷 | 보존 |
+|---|---|---|---|---|
+| sensor.cam0.jpeg | Binary (JPEG) | daq-cam0 | .jpg | 6시간 / 10GB |
+| sensor.cam1.jpeg | Binary (JPEG) | daq-cam1 | .jpg | 6시간 / 10GB |
+| sensor.cam2.jpeg | Binary (JPEG) | daq-cam2 | .jpg | 6시간 / 10GB |
+| sensor.imu | JSON | daq-imu | .parquet | 6시간 / 10GB |
+| sensor.gnss | JSON | daq-gnss | .parquet | 6시간 / 10GB |
 
 ---
 
@@ -113,12 +142,12 @@ daq-kafka/
 ### Camera (Binary)
 
 ```
-[8B  ts_ns     Big-Endian uint64]   ← 수집 시각 (nanoseconds)
-[4B  length    Big-Endian uint32]   ← JPEG payload 길이
-[N B JPEG bytes                 ]   ← 640×360 Q90 JPEG
+[8B  ts_ns    Big-Endian uint64]  ← 수집 시각 (nanoseconds)
+[4B  length   Big-Endian uint32]  ← JPEG payload 길이
+[N B JPEG bytes                ]  ← 640×360 Q90 JPEG
 ```
 
-### IMU/GNSS (JSON)
+### IMU/GNSS (JSON → Parquet)
 
 ```json
 {
@@ -137,9 +166,29 @@ daq-kafka/
 ```
 {bucket}/{date}/{hour}/{timestamp_ns}.{ext}
 
-예) daq-cam0/2026-04-29/23/20260429T232757014532_1777505277014531634.jpg
-    daq-imu/2026-04-29/23/20260429T232757014532_1777505277014531634.json
+예) daq-cam0/2026-04-30/09/20260430T091530123456_1777505277014531634.jpg
+    daq-imu/2026-04-30/09/20260430T091530000000_1777505277000000000.parquet
 ```
+
+---
+
+## IMU/GNSS Parquet 저장 이유
+
+| 항목 | JSON | Parquet (snappy) |
+|---|---|---|
+| 1000 rows 크기 | ~180 KB | ~18 KB |
+| 압축률 | 1x | **~10x** |
+| pandas 쿼리 | `json.load` 후 처리 | `pd.read_parquet()` 직접 |
+| DuckDB/Spark | 변환 필요 | 네이티브 지원 |
+
+JSON은 키 이름이 매 row마다 반복되어 크기가 큽니다. Parquet은 컬럼 단위 저장 + snappy 압축으로 동일 데이터를 약 10배 작게 저장하며 분석 툴에서 직접 쿼리 가능합니다.
+`pyarrow` 미설치 시 자동으로 JSON fallback합니다.
+
+### JPEG 추가 압축이 불가능한 이유
+
+JPEG은 이미 DCT(이산 코사인 변환) 주파수 압축이 적용된 바이너리입니다.
+gzip/zstd 등 범용 압축을 추가로 걸어도 1~3% 절감에 그칩니다.
+용량을 줄이려면 `config.env` 의 `JPEG_QUALITY` 를 낮추는 것(예: 90→80)이 유일한 현실적 방법입니다.
 
 ---
 
@@ -148,51 +197,52 @@ daq-kafka/
 ### 사전 요구사항
 
 ```bash
-# 호스트에 Python confluent-kafka 설치 (카메라 produce용)
+# 호스트 Python confluent-kafka 설치 (최초 1회)
 curl https://bootstrap.pypa.io/pip/3.8/get-pip.py | python3
 python3 -m pip install confluent-kafka
 ```
 
-### 1. 인프라 + IMU + Consumer 시작
+### 1단계 — 인프라 + IMU + Consumer 시작
 
 ```bash
 cd daq-kafka
+
+# 최초 실행 또는 코드 변경 시
+docker compose up -d --build
+
+# 이후 재시작
 docker compose up -d
+
 docker compose ps
 ```
 
-### 2. 카메라 수집 시작 (호스트에서 직접 실행)
+### 2단계 — 카메라 수집 시작
 
 ```bash
-# 포그라운드 실행 (로그 직접 확인)
+# 포그라운드 (로그 직접 확인)
 ./start_cameras.sh
 
-# 백그라운드 실행
+# 백그라운드
 nohup ./start_cameras.sh &
 echo "PID: $!"
-
-# 백그라운드 실행 후 로그 확인
-tail -f logs/cam0.log
-tail -f logs/cam1.log
-tail -f logs/cam2.log
 ```
 
 ### 카메라 수집 중지
 
 ```bash
-# PID로 종료
-kill <PID>
-
-# 또는
 pkill -f start_cameras.sh
+# 또는
+kill <PID>
 ```
 
 ### 개발 PC (카메라 없는 경우)
 
 ```bash
-# cam-producer 관련 서비스 없으므로 그냥 올리면 됨
+# 인프라만 올리기 (cam 관련 컨테이너 없음)
 docker compose up -d
+
 # start_cameras.sh 는 /dev/video* 없으면 자동 skip
+./start_cameras.sh
 ```
 
 ---
@@ -200,7 +250,7 @@ docker compose up -d
 ## 로그 확인
 
 ```bash
-# 카메라 파이프 로그
+# 카메라 파이프 로그 (실시간)
 tail -f logs/cam0.log
 tail -f logs/cam1.log
 tail -f logs/cam2.log
@@ -209,20 +259,26 @@ tail -f logs/cam2.log
 docker compose logs -f minio-consumer
 docker compose logs -f imu-producer
 docker logs kafka-init
+
+# MinIO 적재 현황 확인
+docker exec minio mc ls local/daq-cam0 --recursive | head -20
+docker exec minio mc ls local/daq-imu  --recursive | head -20
 ```
+
+> 로그는 `LOG_RETENTION_DAYS`(기본 3일) 경과 시 `start_cameras.sh` 실행 시점에 자동 삭제됩니다.
 
 ---
 
 ## Web UI
 
-| 서비스 | URL (서버 IP 기준) | 계정 |
+| 서비스 | URL | 계정 |
 |---|---|---|
 | Confluent Control Center | http://192.168.10.141:9021 | — |
 | MinIO Console | http://192.168.10.141:9001 | minioadmin / minioadmin123 |
 | Schema Registry API | http://192.168.10.141:8081 | — |
 
-> ⚠️ 원격 서버 접속 시 `localhost` 대신 **서버 IP**(`192.168.10.141`)로 접속해야 합니다.
-> MinIO Object Browser에서 버킷 클릭 후 날짜 폴더(`2026-04-30/`)를 클릭하면 파일 목록이 보입니다.
+> ⚠️ 원격 서버 접속 시 `localhost` 가 아닌 **서버 IP** 로 접속해야 합니다.
+> MinIO Object Browser에서 버킷 클릭 → 날짜 폴더(`2026-04-30/`) 클릭해야 파일 목록이 보입니다.
 
 ---
 
@@ -232,11 +288,11 @@ docker logs kafka-init
 # Kafka topic 목록
 docker exec kafka-broker kafka-topics --bootstrap-server localhost:9092 --list
 
-# topic 메시지 수 확인
+# topic offset(메시지 수) 확인
 docker exec kafka-broker kafka-run-class kafka.tools.GetOffsetShell \
   --bootstrap-server localhost:9092 --topic sensor.cam0.jpeg
 
-# MinIO 파일 목록 (CLI)
+# MinIO 파일 목록
 docker exec minio mc ls local/daq-cam0 --recursive | head -20
 docker exec minio mc ls local/daq-imu  --recursive | head -20
 
@@ -264,25 +320,27 @@ docker compose down -v
  │    ├── minio:9000
  │    └── control-center:9021
  │
- ├── 9092/tcp  → kafka-broker        (내부용)
- ├── 29092/tcp → kafka-broker        (호스트 → Kafka, start_cameras.sh 사용)
- ├── 9000/tcp  → minio               (S3 API)
- ├── 9001/tcp  → minio               (Console UI)
- ├── 9021/tcp  → control-center      (Kafka UI)
+ ├── 29092/tcp → kafka-broker   (호스트 → Kafka, start_cameras.sh 사용)
+ ├── 9092/tcp  → kafka-broker   (컨테이너 내부용)
+ ├── 9000/tcp  → minio          (S3 API)
+ ├── 9001/tcp  → minio          (Console UI)
+ ├── 9021/tcp  → control-center (Kafka UI)
  ├── 8081/tcp  → schema-registry
- └── 1111/udp  → imu-producer        (BynavX1 패킷 수신)
+ └── 1111/udp  → imu-producer   (BynavX1 패킷 수신)
 ```
 
 ---
 
-## 알려진 제약사항 및 트러블슈팅
+## 트러블슈팅
 
-| 항목 | 내용 | 해결 |
+| 증상 | 원인 | 해결 |
 |---|---|---|
-| 카메라 컨테이너화 불가 | gw5300은 Tegra ISP 전용 — 컨테이너 내 GStreamer 플러그인 스캐너 충돌 | `start_cameras.sh` 호스트 직접 실행으로 우회 |
-| MinIO UI 빈 화면 | 날짜 폴더 구조라 최상위가 비어 보임 | 버킷 클릭 후 날짜 폴더(`YYYY-MM-DD/`) 클릭 |
-| localhost 접속 불가 | 원격 서버라 localhost는 본인 PC를 가리킴 | 서버 IP(`192.168.10.141`)로 접속 |
-| BynavX1 MSG_ID | RAWIMUX=268, INSPVAXB=1465 — 펌웨어마다 다를 수 있음 | `imu_producer.py` 상수 확인 후 수정 |
-| Kafka replication | replication.factor=1 (단일 브로커) | 멀티 브로커 구성 시 조정 필요 |
-| MinIO 인증 | minioadmin/minioadmin123 | 실 배포 시 반드시 변경 |
-| video GID | `"44"` 하드코딩 (Ubuntu 표준) | 다른 OS: `stat -c %g /dev/video0` 로 확인 |
+| cam-producer `GStreamer plugin loader failed` | 컨테이너 내 Tegra GStreamer 충돌 | `start_cameras.sh` 호스트 직접 실행으로 해결됨 |
+| cam-producer `select() timeout` | cv2.VideoCapture로 gw5300 접근 불가 | GStreamer appsink → stdin pipe 방식으로 교체됨 |
+| `UNKNOWN_TOPIC_OR_PART` | kafka-init 완료 전 consumer 기동 | 에러 무시 후 재시도 루프로 처리됨 |
+| MinIO UI 빈 화면 | 날짜 폴더 구조 — 최상위가 비어 보임 | 버킷 클릭 후 날짜 폴더(`YYYY-MM-DD/`) 클릭 |
+| `localhost` 접속 불가 | 원격 서버라 localhost는 본인 PC를 가리킴 | 서버 IP(`192.168.10.141`)로 접속 |
+| `docker attach` pipe 끊김 재연결 불가 | attach는 PID 1 stdin에 붙어 재연결 불가 | `docker exec -i` → 호스트 직접 실행으로 전환 |
+| `group_add: video` 컨테이너 오류 | python:slim 내부에 video 그룹 없음 | GID `"44"` 숫자로 지정 |
+| cam-producer `numpy _ARRAY_API not found` | OpenCV가 NumPy 1.x 기준 컴파일 | `requirements.txt` 에 `numpy<2` 핀 추가 |
+| BynavX1 MSG_ID 불일치 | 펌웨어 버전마다 ID 다름 | `imu_producer.py` 상수 확인 후 수정 |
