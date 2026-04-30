@@ -1,10 +1,10 @@
 # DAQ Kafka-MinIO Pipeline
 
-Camera(V4L2/Tegra) / IMU(BynavX1) → Confluent Kafka → MinIO S3
+Camera(V4L2/Tegra) / IMU(NOVATEL) → Confluent Kafka → MinIO S3
 
 **Platform:** AP500L / NVIDIA Orin (aarch64, Tegra ISP)
 **Cameras:** `/dev/video0~2` (gw5300, UYVY) — 1920×1080 20fps → 1fps JPEG 640×360 Kafka 발행
-**IMU/GNSS:** BynavX1 UDP `192.168.20.50:1111` → Parquet 저장
+**IMU/GNSS:** NOVATEL UDP `192.168.20.50:1111` → Parquet 저장
 
 ---
 
@@ -63,7 +63,7 @@ daq-kafka/
 | kafka-init | cp-kafka:7.6.1 | — | Topic 사전 생성 후 종료 |
 | minio | minio/minio:latest | 9000 / 9001 | Object Storage / Console |
 | minio-init | minio/mc:latest | — | Bucket 생성 후 종료 |
-| imu-producer | (build) | 1111/udp | BynavX1 UDP → `sensor.imu` / `sensor.gnss` |
+| imu-producer | (build) | 1111/udp | NOVATEL UDP → `sensor.imu` / `sensor.gnss` |
 | minio-consumer | (build) | — | 전체 토픽 → MinIO 저장 |
 
 ### 호스트 프로세스
@@ -297,7 +297,7 @@ docker compose down -v
  ├── 9001/tcp  → minio          (Console UI)
  ├── 9021/tcp  → control-center (Kafka UI)
  ├── 8081/tcp  → schema-registry
- └── 1111/udp  → imu-producer   (BynavX1 패킷 수신)
+ └── 1111/udp  → imu-producer   (NOVATEL 패킷 수신)
 ```
 
 ---
@@ -314,7 +314,7 @@ docker compose down -v
 | `docker attach` pipe 끊김 재연결 불가 | attach는 PID 1 stdin에 붙어 재연결 불가 | `docker exec -i` → 호스트 직접 실행으로 전환 |
 | `group_add: video` 컨테이너 오류 | python:slim 내부에 video 그룹 없음 | GID `"44"` 숫자로 지정 |
 | cam-producer `numpy _ARRAY_API not found` | OpenCV가 NumPy 1.x 기준 컴파일 | `requirements.txt` 에 `numpy<2` 핀 추가 |
-| BynavX1 MSG_ID 불일치 | 펌웨어 버전마다 ID 다름 | `imu_producer.py` 상수 확인 후 수정 |
+| NOVATEL MSG_ID 불일치 | 펌웨어 버전마다 ID 다름 | `imu_producer.py` 상수 확인 후 수정 |
 
 ---
 
