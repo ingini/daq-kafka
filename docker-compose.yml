@@ -1,5 +1,3 @@
-version: "3.9"
-
 # ============================================================
 #  Camera/IMU → Confluent Kafka → MinIO  Pipeline
 #  Platform : AP500L / Orin
@@ -282,6 +280,7 @@ services:
       dockerfile: Dockerfile
     container_name: minio-consumer
     restart: unless-stopped
+    stop_grace_period: 10s   # 종료 시 잔여 Parquet flush 대기
     depends_on:
       kafka-broker:
         condition: service_healthy
@@ -289,6 +288,10 @@ services:
         condition: service_healthy
     networks:
       - daq-net
+    # STORAGE_BACKEND=local 사용 시 아래 volumes 주석 해제
+    # volumes:
+    #   - /mnt/usb:/mnt/usb               # USB 마운트
+    #   - /data/DAQ:/mnt/storage/DAQ      # 내부 디스크
     environment:
       KAFKA_BOOTSTRAP: kafka-broker:9092
       KAFKA_GROUP_ID: minio-consumer-group
@@ -314,3 +317,9 @@ services:
       FLUSH_INTERVAL: 5
       IMU_STORAGE_FORMAT: parquet
       IMU_PARQUET_BATCH: 1000
+      # ── 스토리지 백엔드 ──────────────────────────────────────
+      # minio : MinIO S3 (기본)
+      # local : 로컬 디스크 / USB 마운트
+      STORAGE_BACKEND: auto          # auto|minio|local
+      LOCAL_BASE_PATH: /media/swm    # USB 마운트 루트 ($USER 자동 치환)
+      LOCAL_FALLBACK_PATH: /data/DAQ # USB 없을 때 내부 디스크
