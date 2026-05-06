@@ -47,7 +47,8 @@ MINIO_SECURE     = os.environ.get("MINIO_ENDPOINT","").startswith("https")
 MINIO_BUCKET     = os.environ.get("MINIO_BUCKET", "daq")
 
 # Local 설정
-LOCAL_BASE_PATH  = os.environ.get("LOCAL_BASE_PATH", "/mnt/storage/DAQ")
+# LOCAL_BASE_PATH = /media/$USER  형태로 설정하면 USB 이름 자동 탐지
+LOCAL_BASE_PATH  = os.environ.get("LOCAL_BASE_PATH", f"/media/{os.environ.get('USER', 'user')}")
 
 TOPIC_SENSOR_MAP: dict = json.loads(
     os.environ.get("TOPIC_SENSOR_MAP", json.dumps({
@@ -100,7 +101,7 @@ class MinIOBackend:
             log.info("Created bucket: %s", MINIO_BUCKET)
         log.info("MinIO backend ready  bucket=%s", MINIO_BUCKET)
 
-    def save(self, rel_path: str, data: bytes, content_type: str):
+    def save(self, rel_path: str, data: bytes, content_type: str, **kwargs):
         from minio.error import S3Error
         try:
             self.client.put_object(
@@ -116,33 +117,90 @@ class MinIOBackend:
         return f"MinIO  bucket={MINIO_BUCKET}  endpoint={MINIO_ENDPOINT}"
 
 
-# ── Local 백엔드 ──────────────────────────────────────────────
+# ── Local 백엔드 (USB 자동 탐지) ─────────────────────────────
 class LocalBackend:
+    """
+    LOCAL_BASE_PATH=/media/$USER 로 설정하면
+    해당 경로 아래 첫 번째 마운트된 USB 디렉토리를 자동 탐지.
+
+    저장 경로:
+      {LOCAL_BASE_PATH}/{usb_name}/{yyyymmdd}/{vehicle_id}/{sensor}/{timestamp}.{ext}
+      예) /media/swm/USB_32G/20260430/KOR-1234/cam0/20260430T091530_xxx.jpg
+
+    USB 가 없으면 {LOCAL_BASE_PATH}/DAQ/{yyyymmdd}/... 에 저장.
+    """
+
     def __init__(self):
-        base = Path(LOCAL_BASE_PATH)
-        base.mkdir(parents=True, exist_ok=True)
-        # 마운트 포인트 쓰기 가능 확인
-        test_file = base / ".write_test"
+        self.base_mount = LOCAL_BASE_PATH
+        self.usb_name   = self._find_usb()
+        self.base_path  = Path(self.base_mount) / self.usb_name
+        self.base_path.mkdir(parents=True, exist_ok=True)
+
+        # 쓰기 가능 확인
+        test_file = self.base_path / ".write_test"
         try:
             test_file.write_bytes(b"ok")
             test_file.unlink()
         except OSError as e:
-            raise RuntimeError(f"LOCAL_BASE_PATH {LOCAL_BASE_PATH} not writable: {e}")
-        log.info("Local backend ready  base=%s", LOCAL_BASE_PATH)
+            raise RuntimeError(f"Not writable: {self.base_path}  ({e})")
 
-    def save(self, rel_path: str, data: bytes, content_type: str):
-        full_path = Path(LOCAL_BASE_PATH) / rel_path
+        log.info("Local backend ready  path=%s  usb=%s", self.base_path, self.usb_name)
+
+    def _find_usb(self) -> str:
+        """LOCAL_BASE_PATH 아래 첫 번째 디렉토리(USB 이름)를 반환."""
+        base = Path(self.base_mount)
+        if not base.exists():
+            log.warning("LOCAL_BASE_PATH %s not found, using DAQ", self.base_mount)
+            return "DAQ"
+        dirs = [d for d in base.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        if not dirs:
+            log.warning("No USB found under %s, using DAQ", self.base_mount)
+            return "DAQ"
+        usb = sorted(dirs)[0].name
+        log.info("USB detected: %s", usb)
+        return usb
+
+    def make_path(self, sensor: str, ts_ns: int, ext: str) -> Path:
+        """
+        {base_path}/{yyyymmdd}/{vehicle_id}/{sensor}/{timestamp}.{ext}
+        """
+        ts = datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc)
+        date_str  = ts.strftime("%Y%m%d")
+        ts_str    = f"{ts.strftime('%Y%m%dT%H%M%S')}_{ts_ns}"
+        full_path = (
+            self.base_path
+            / date_str
+            / VEHICLE_ID
+            / sensor
+            / f"{ts_str}.{ext}"
+        )
+        return full_path
+
+    def save(self, rel_path: str, data: bytes, content_type: str,
+             ts_ns: int = 0, sensor: str = ""):
+        """rel_path 는 MinIO 호환용, Local은 make_path 로 직접 생성."""
+        # rel_path 에서 sensor/timestamp 파싱해서 로컬 경로 재구성
+        parts   = Path(rel_path)
+        ext     = parts.suffix.lstrip(".")
+        ts_ns_  = ts_ns if ts_ns else time.time_ns()
+        sen_    = sensor if sensor else parts.parent.name
+
+        full_path = self.make_path(sen_, ts_ns_, ext)
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_bytes(data)
         log.debug("Local saved: %s (%d B)", full_path, len(data))
 
     def info(self) -> str:
-        # 디스크 여유 공간 표시
         import shutil
-        stat = shutil.disk_usage(LOCAL_BASE_PATH)
-        free_gb = stat.free / 1024**3
-        total_gb = stat.total / 1024**3
-        return f"Local  path={LOCAL_BASE_PATH}  free={free_gb:.1f}GB/{total_gb:.1f}GB"
+        try:
+            stat     = shutil.disk_usage(str(self.base_path))
+            free_gb  = stat.free  / 1024**3
+            total_gb = stat.total / 1024**3
+            return (f"Local  usb={self.usb_name}  "
+                    f"path={self.base_path}  "
+                    f"free={free_gb:.1f}GB/{total_gb:.1f}GB")
+        except Exception:
+            return f"Local  path={self.base_path}"
 
 
 # ── 백엔드 초기화 ─────────────────────────────────────────────
@@ -242,7 +300,7 @@ def main():
                     if is_camera_topic(topic):
                         jpeg, ts_ns = decode_camera(raw)
                         rel_path = make_rel_path(sensor, ts_ns, "jpg")
-                        pending_cam.append((rel_path, jpeg, "image/jpeg"))
+                        pending_cam.append((rel_path, jpeg, "image/jpeg", sensor, ts_ns))
                     else:
                         payload = json.loads(raw.decode())
                         ts_ns   = payload.get("ts_ns", time.time_ns())
@@ -252,7 +310,7 @@ def main():
                             rel_path = make_rel_path(sensor, ts_ns, "json")
                             pending_cam.append((rel_path,
                                 json.dumps(payload, ensure_ascii=False).encode(),
-                                "application/json"))
+                                "application/json", sensor, ts_ns))
                 except Exception as e:
                     log.error("Decode error topic=%s: %s", topic, e)
 
@@ -265,9 +323,12 @@ def main():
             if cam_full or imu_full or time_up:
                 saved = 0
 
-                for (path, data, ctype) in pending_cam:
+                for item in pending_cam:
+                    path, data, ctype = item[0], item[1], item[2]
+                    sen  = item[3] if len(item) > 3 else ""
+                    tsn  = item[4] if len(item) > 4 else 0
                     try:
-                        backend.save(path, data, ctype)
+                        backend.save(path, data, ctype, ts_ns=tsn, sensor=sen)
                         saved += 1
                     except Exception as e:
                         log.error("Save error: %s", e)
@@ -292,9 +353,12 @@ def main():
         pass
     finally:
         log.info("Shutdown — flushing remaining...")
-        for (path, data, ctype) in pending_cam:
+        for item in pending_cam:
+            path, data, ctype = item[0], item[1], item[2]
+            sen = item[3] if len(item) > 3 else ""
+            tsn = item[4] if len(item) > 4 else 0
             try:
-                backend.save(path, data, ctype)
+                backend.save(path, data, ctype, ts_ns=tsn, sensor=sen)
             except Exception as e:
                 log.error("Final flush error: %s", e)
         for sensor_key, rows in pending_imu.items():
