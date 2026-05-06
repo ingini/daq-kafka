@@ -1,10 +1,10 @@
-# DAQ Kafka-MinIO Pipeline
+# DAQ Kafka Pipeline
 
-Camera(V4L2/Tegra) / IMU(NOVATEL) → Confluent Kafka → MinIO S3
+Camera(V4L2/Tegra) / IMU(NovAtel) → Confluent Kafka → Storage
 
 **Platform:** AP500L / NVIDIA Orin (aarch64, Tegra ISP)
 **Cameras:** `/dev/video0~2` (gw5300, UYVY) — 1920×1080 20fps → 1fps JPEG 640×360 Kafka 발행
-**IMU/GNSS:** NOVATEL UDP `192.168.20.50:1111` → Parquet 저장
+**IMU/GNSS:** NovAtel PwrPak7D-E1 UDP `192.168.20.50:1111` → Parquet 저장
 
 ---
 
@@ -13,9 +13,8 @@ Camera(V4L2/Tegra) / IMU(NOVATEL) → Confluent Kafka → MinIO S3
 <img width="1358" height="1198" alt="image" src="https://github.com/user-attachments/assets/54c5c04c-3899-4e3d-ba06-0254f18cb994" />
 
 
-
 > **카메라는 호스트에서 직접 실행합니다.**
-> gw5300은 Tegra ISP 전용 카메라로 Docker 컨테이너 내 GStreamer 플러그인 스캐너와 충돌합니다.
+> gw5300은 Tegra ISP 전용 카메라로 컨테이너 내 GStreamer 플러그인 스캐너와 충돌합니다.
 > `start_cameras.sh` 가 호스트 GStreamer로 캡처 → Python이 직접 Kafka로 produce합니다.
 
 ---
@@ -24,9 +23,10 @@ Camera(V4L2/Tegra) / IMU(NOVATEL) → Confluent Kafka → MinIO S3
 
 ```
 daq-kafka/
-├── config.env               ← 모든 설정값 (IP, 포트, 해상도 등)
+├── config.env               ← 모든 설정값 (IP, 포트, 해상도, 스토리지 등)
 ├── docker-compose.yml
 ├── start_cameras.sh         ← 호스트 직접 실행 (카메라 → Kafka)
+├── stop_cameras.sh          ← 카메라 수집 중지
 ├── README.md
 ├── logs/                    ← 자동 생성, 3일 경과 로그 자동 삭제
 │   ├── cam0.log
@@ -40,12 +40,12 @@ daq-kafka/
 │   └── imu/
 │       ├── Dockerfile
 │       ├── requirements.txt
-│       └── imu_producer.py
+│       └── imu_producer.py  ← NovAtel OEM7 Binary 파서
 └── consumers/
     └── minio/
         ├── Dockerfile
         ├── requirements.txt  ← pyarrow 포함
-        └── minio_consumer.py ← JPEG→jpg / IMU→parquet
+        └── minio_consumer.py ← Fallback 스토리지 (USB→MinIO→내부)
 ```
 
 ---
@@ -62,54 +62,93 @@ daq-kafka/
 | control-center | cp-enterprise-control-center:7.6.1 | 9021 | Kafka Web UI |
 | kafka-init | cp-kafka:7.6.1 | — | Topic 사전 생성 후 종료 |
 | minio | minio/minio:latest | 9000 / 9001 | Object Storage / Console |
-| minio-init | minio/mc:latest | — | Bucket 생성 후 종료 |
-| imu-producer | (build) | 1111/udp | NOVATEL UDP → `sensor.imu` / `sensor.gnss` |
-| minio-consumer | (build) | — | 전체 토픽 → MinIO 저장 |
+| minio-init | minio/mc:latest | — | `daq` 버킷 생성 후 종료 |
+| imu-producer | (build) | 1111/udp | NovAtel UDP → `sensor.imu` / `sensor.gnss` |
+| minio-consumer | (build) | — | 전체 토픽 → Fallback 스토리지 저장 |
 
 ### 호스트 프로세스
 
 | 프로세스 | 실행 방식 | 역할 |
 |---|---|---|
 | start_cameras.sh | `./start_cameras.sh` | gst-launch + cam_producer.py × 3 |
-| cam_producer.py | start_cameras.sh 내부 호출 | JPEG stdin → `sensor.camN.jpeg` |
+| stop_cameras.sh | `./stop_cameras.sh` | 카메라 파이프 전체 종료 |
 
 ---
 
 ## 설정 관리 (config.env)
 
 모든 설정은 `config.env` 한 파일에서 관리합니다.
-`start_cameras.sh` 는 실행 시 자동으로 `source config.env` 합니다.
 
 ```bash
-# 주요 설정 항목
+# ── 차량 식별 ──────────────────────────────────────────────────
+VEHICLE_ID=KOR-1234              # MinIO/Local 경로에 포함
+
+# ── Kafka ─────────────────────────────────────────────────────
 KAFKA_HOST=localhost
-KAFKA_PORT=29092              # 호스트 → Kafka (start_cameras.sh)
+KAFKA_PORT=29092                 # 호스트 → Kafka
 
-IMU_SRC_IP=192.168.20.50
-IMU_DST_PORT=1111
-
-CAP_WIDTH=1920   CAP_HEIGHT=1080   CAP_FPS=20
-OUT_WIDTH=640    OUT_HEIGHT=360
+# ── 카메라 ────────────────────────────────────────────────────
+CAP_WIDTH=1920  CAP_HEIGHT=1080  CAP_FPS=20
+OUT_WIDTH=640   OUT_HEIGHT=360
 JPEG_QUALITY=90
 PUBLISH_FPS=1
 
-IMU_STORAGE_FORMAT=parquet    # parquet | json
-IMU_PARQUET_BATCH=1000        # N rows 누적 후 1 Parquet 파일
+# ── IMU ───────────────────────────────────────────────────────
+IMU_SRC_IP=192.168.20.50
+IMU_DST_PORT=1111
+IMU_STORAGE_FORMAT=parquet       # parquet | json
+IMU_PARQUET_BATCH=1000
 
-LOG_RETENTION_DAYS=3          # 3일 경과 로그 자동 삭제
+# ── 스토리지 백엔드 ────────────────────────────────────────────
+STORAGE_BACKEND=auto             # auto | minio | local
+#   auto  : USB → MinIO → 내부 디스크 순서로 자동 Fallback
+#   minio : MinIO 전용
+#   local : USB → 내부 디스크 (MinIO 사용 안 함)
+
+LOCAL_BASE_PATH=/media/$USER     # USB 마운트 루트 (USB 이름 자동 탐지)
+LOCAL_FALLBACK_PATH=/data/DAQ    # USB 없을 때 차량 내부 디스크
+
+# ── 로그 ──────────────────────────────────────────────────────
+LOG_RETENTION_DAYS=3             # N일 경과 로그 자동 삭제
 ```
+
+---
+
+## 스토리지 Fallback 구조
+
+```
+minio-consumer 시작 시 순서대로 초기화 시도:
+
+  ① USB  (/media/$USER/{usb_name})    ← 최우선
+      ↓ 실패 (USB 없음 / 마운트 안됨)
+  ② MinIO (http://minio:9000)         ← 2순위
+      ↓ 실패 (서버 없음 / 네트워크 끊김)
+  ③ 내부 디스크 (/data/DAQ)           ← 최후 fallback
+      ↓ 실패
+  ✗ RuntimeError — 컨테이너 종료 (수집 불가 명시)
+
+수집 중 실시간 fallback:
+  저장 중 현재 백엔드 실패 → 즉시 다음 순위 백엔드로 전환
+  로그: [Fallback] switched to MinIO
+```
+
+| STORAGE_BACKEND | 동작 |
+|---|---|
+| `auto` | USB → MinIO → 내부 디스크 자동 fallback |
+| `minio` | MinIO 전용, 실패 시 에러 |
+| `local` | USB → 내부 디스크, MinIO 사용 안 함 |
 
 ---
 
 ## Kafka Topic 설계
 
-| Topic | 데이터 타입 | MinIO Bucket | 파일 포맷 | 보존 |
-|---|---|---|---|---|
-| sensor.cam0.jpeg | Binary (JPEG) | daq-cam0 | .jpg | 6시간 / 10GB |
-| sensor.cam1.jpeg | Binary (JPEG) | daq-cam1 | .jpg | 6시간 / 10GB |
-| sensor.cam2.jpeg | Binary (JPEG) | daq-cam2 | .jpg | 6시간 / 10GB |
-| sensor.imu | JSON | daq-imu | .parquet | 6시간 / 10GB |
-| sensor.gnss | JSON | daq-gnss | .parquet | 6시간 / 10GB |
+| Topic | 데이터 타입 | 파일 포맷 | 보존 |
+|---|---|---|---|
+| sensor.cam0.jpeg | Binary (JPEG) | .jpg | 6시간 / 10GB |
+| sensor.cam1.jpeg | Binary (JPEG) | .jpg | 6시간 / 10GB |
+| sensor.cam2.jpeg | Binary (JPEG) | .jpg | 6시간 / 10GB |
+| sensor.imu | JSON | .parquet | 6시간 / 10GB |
+| sensor.gnss | JSON | .parquet | 6시간 / 10GB |
 
 ---
 
@@ -137,18 +176,23 @@ LOG_RETENTION_DAYS=3          # 3일 경과 로그 자동 삭제
 }
 ```
 
-### MinIO 오브젝트 경로
+### 저장 경로
 
 ```
-{bucket}/{date}/{hour}/{timestamp_ns}.{ext}
+MinIO:
+  daq/{year}/{month}/{day}/{hour}/{vehicle_id}/{sensor}/{timestamp}.{ext}
+  예) daq/2026/04/30/09/KOR-1234/cam0/20260430T091530_1777505277.jpg
+      daq/2026/04/30/09/KOR-1234/imu/20260430T091530_1777505277.parquet
 
-예) daq-cam0/2026-04-30/09/20260430T091530123456_1777505277014531634.jpg
-    daq-imu/2026-04-30/09/20260430T091530000000_1777505277000000000.parquet
+USB / 내부 디스크:
+  {base}/{usb_name}/{yyyymmdd}/{vehicle_id}/{sensor}/{timestamp}.{ext}
+  예) /media/swm/USB_32G/20260430/KOR-1234/cam0/20260430T091530_1777505277.jpg
+      /data/DAQ/20260430/KOR-1234/imu/20260430T091530_1777505277.parquet
 ```
 
 ---
 
-## IMU/GNSS Parquet 저장 이유
+## IMU Parquet 저장 이유
 
 | 항목 | JSON | Parquet (snappy) |
 |---|---|---|
@@ -157,9 +201,13 @@ LOG_RETENTION_DAYS=3          # 3일 경과 로그 자동 삭제
 | pandas 쿼리 | `json.load` 후 처리 | `pd.read_parquet()` 직접 |
 | DuckDB/Spark | 변환 필요 | 네이티브 지원 |
 
-JSON은 키 이름이 매 row마다 반복되어 크기가 큽니다. Parquet은 컬럼 단위 저장 + snappy 압축으로 동일 데이터를 약 10배 작게 저장하며 분석 툴에서 직접 쿼리 가능합니다.
 `pyarrow` 미설치 시 자동으로 JSON fallback합니다.
+1000줄 미만으로 수집 종료해도 `finally` 블록에서 잔여 rows를 Parquet으로 저장합니다.
 
+### JPEG 추가 압축이 불가한 이유
+
+JPEG은 이미 DCT 주파수 압축이 적용된 바이너리입니다. gzip/zstd를 추가해도 1~3% 절감에 그칩니다.
+용량을 줄이려면 `config.env` 의 `JPEG_QUALITY` 를 낮추는 것(예: 90→80)이 유일한 현실적 방법입니다.
 
 ---
 
@@ -187,33 +235,28 @@ docker compose up -d
 docker compose ps
 ```
 
-### 2단계 — 카메라 수집 시작
+### 2단계 — 카메라 수집 시작 / 중지
 
 ```bash
-# 포그라운드 (로그 직접 확인)
+# 포그라운드
 ./start_cameras.sh
 
 # 백그라운드
 nohup ./start_cameras.sh &
 echo "PID: $!"
+
+# 중지
+./stop_cameras.sh
 ```
 
-### 카메라 수집 중지
+### MinIO 버킷 이름 주의
+
+MinIO S3 규격상 버킷 이름은 **소문자만** 허용됩니다.
+`config.env` 의 `MINIO_BUCKET` 은 반드시 소문자로 설정하세요.
 
 ```bash
-pkill -f start_cameras.sh
-# 또는
-kill <PID>
-```
-
-### 개발 PC (카메라 없는 경우)
-
-```bash
-# 인프라만 올리기 (cam 관련 컨테이너 없음)
-docker compose up -d
-
-# start_cameras.sh 는 /dev/video* 없으면 자동 skip
-./start_cameras.sh
+MINIO_BUCKET=daq   # O
+MINIO_BUCKET=DAQ   # X  (InvalidBucketName 에러)
 ```
 
 ---
@@ -231,25 +274,29 @@ docker compose logs -f minio-consumer
 docker compose logs -f imu-producer
 docker logs kafka-init
 
-# MinIO 적재 현황 확인
-docker exec minio mc ls local/daq-cam0 --recursive | head -20
-docker exec minio mc ls local/daq-imu  --recursive | head -20
+# MinIO 적재 확인
+docker exec minio mc ls local/daq --recursive | head -20
+
+# USB 저장 확인
+ls /media/$USER/
+ls /media/$USER/{usb_name}/20260430/KOR-1234/
 ```
 
 > 로그는 `LOG_RETENTION_DAYS`(기본 3일) 경과 시 `start_cameras.sh` 실행 시점에 자동 삭제됩니다.
+> minio-consumer는 60초마다 현재 스토리지 상태(백엔드, 남은 용량)를 로그에 출력합니다.
 
 ---
 
 ## Web UI
 
-| 서비스 | URL | 계정 |
+| 서비스 | URL (서버 IP 기준) | 계정 |
 |---|---|---|
 | Confluent Control Center | http://192.168.10.141:9021 | — |
 | MinIO Console | http://192.168.10.141:9001 | minioadmin / minioadmin123 |
 | Schema Registry API | http://192.168.10.141:8081 | — |
 
 > ⚠️ 원격 서버 접속 시 `localhost` 가 아닌 **서버 IP** 로 접속해야 합니다.
-> MinIO Object Browser에서 버킷 클릭 → 날짜 폴더(`2026-04-30/`) 클릭해야 파일 목록이 보입니다.
+> MinIO Object Browser: 버킷 클릭 → 연도 폴더(`2026/`) → 월 → 일 → 시 → 차량번호 → 센서 순으로 탐색합니다.
 
 ---
 
@@ -263,9 +310,13 @@ docker exec kafka-broker kafka-topics --bootstrap-server localhost:9092 --list
 docker exec kafka-broker kafka-run-class kafka.tools.GetOffsetShell \
   --bootstrap-server localhost:9092 --topic sensor.cam0.jpeg
 
+# consumer group lag 확인
+docker exec kafka-broker kafka-consumer-groups \
+  --bootstrap-server localhost:9092 \
+  --describe --group minio-consumer-group
+
 # MinIO 파일 목록
-docker exec minio mc ls local/daq-cam0 --recursive | head -20
-docker exec minio mc ls local/daq-imu  --recursive | head -20
+docker exec minio mc ls local/daq --recursive | head -20
 
 # 특정 컨테이너 재시작
 docker compose restart minio-consumer
@@ -297,7 +348,7 @@ docker compose down -v
  ├── 9001/tcp  → minio          (Console UI)
  ├── 9021/tcp  → control-center (Kafka UI)
  ├── 8081/tcp  → schema-registry
- └── 1111/udp  → imu-producer   (NOVATEL 패킷 수신)
+ └── 1111/udp  → imu-producer   (NovAtel 패킷 수신)
 ```
 
 ---
@@ -307,14 +358,17 @@ docker compose down -v
 | 증상 | 원인 | 해결 |
 |---|---|---|
 | cam-producer `GStreamer plugin loader failed` | 컨테이너 내 Tegra GStreamer 충돌 | `start_cameras.sh` 호스트 직접 실행으로 해결됨 |
-| cam-producer `select() timeout` | cv2.VideoCapture로 gw5300 접근 불가 | GStreamer appsink → stdin pipe 방식으로 교체됨 |
+| cam-producer `select() timeout` | cv2.VideoCapture로 gw5300 접근 불가 | GStreamer → stdin pipe 방식으로 교체됨 |
 | `UNKNOWN_TOPIC_OR_PART` | kafka-init 완료 전 consumer 기동 | 에러 무시 후 재시도 루프로 처리됨 |
-| MinIO UI 빈 화면 | 날짜 폴더 구조 — 최상위가 비어 보임 | 버킷 클릭 후 날짜 폴더(`YYYY-MM-DD/`) 클릭 |
-| `localhost` 접속 불가 | 원격 서버라 localhost는 본인 PC를 가리킴 | 서버 IP(`192.168.10.141`)로 접속 |
-| `docker attach` pipe 끊김 재연결 불가 | attach는 PID 1 stdin에 붙어 재연결 불가 | `docker exec -i` → 호스트 직접 실행으로 전환 |
-| `group_add: video` 컨테이너 오류 | python:slim 내부에 video 그룹 없음 | GID `"44"` 숫자로 지정 |
-| cam-producer `numpy _ARRAY_API not found` | OpenCV가 NumPy 1.x 기준 컴파일 | `requirements.txt` 에 `numpy<2` 핀 추가 |
-| NOVATEL MSG_ID 불일치 | 펌웨어 버전마다 ID 다름 | `imu_producer.py` 상수 확인 후 수정 |
+| `InvalidBucketName` | MinIO 버킷 이름에 대문자 사용 | `MINIO_BUCKET=daq` 소문자로 변경 |
+| MinIO UI 빈 화면 | 계층형 폴더 구조 — 최상위가 비어 보임 | `2026/` → `04/` → `30/` → ... 순으로 탐색 |
+| `localhost` 접속 불가 | 원격 서버라 localhost는 본인 PC | 서버 IP(`192.168.10.141`)로 접속 |
+| `docker attach` pipe 끊김 | attach는 재연결 불가 | 호스트 직접 실행 방식으로 전환 |
+| `group_add: video` 오류 | python:slim 내부에 video 그룹 없음 | GID `"44"` 숫자로 지정 |
+| cam-producer `numpy _ARRAY_API` | OpenCV가 NumPy 1.x 기준 컴파일 | `requirements.txt` 에 `numpy<2` 핀 추가 |
+| NovAtel 파싱 실패 | Sync byte 불일치 | `imu_producer.py` `NOVATEL_SYNC2=0x12` 확인 |
+| USB 미탐지 | `/media/$USER` 아래 디렉토리 없음 | `lsblk` 로 마운트 확인, `LOCAL_BASE_PATH` 조정 |
+| 모든 스토리지 실패 | USB/MinIO/내부 디스크 모두 불가 | consumer 종료 — 원인 확인 후 재시작 |
 
 ---
 
