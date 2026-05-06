@@ -1,45 +1,55 @@
 # ============================================================
 #  consumers/minio/minio_consumer.py
-#  Confluent Kafka → MinIO (단일 버킷, 계층형 경로)
+#  Confluent Kafka → Storage (MinIO or Local/USB)
 #
-#  오브젝트 경로:
-#    DAQ/{year}/{month}/{day}/{hour}/{vehicle_id}/{sensor}/{timestamp}.{ext}
+#  STORAGE_BACKEND=minio  : MinIO S3 저장
+#  STORAGE_BACKEND=local  : 로컬 디스크 / USB 마운트 경로 저장
 #
-#  예) DAQ/2026/04/30/09/KOR-1234/cam0/20260430T091530_1777505277.jpg
-#      DAQ/2026/04/30/09/KOR-1234/imu/20260430T091530_1777505277.parquet
-#      DAQ/2026/04/30/09/KOR-1234/gnss/20260430T091530_1777505277.parquet
+#  경로 구조 (공통):
+#    {root}/{year}/{month}/{day}/{hour}/{vehicle_id}/{sensor}/{timestamp}.{ext}
 #
-#  - Camera (binary JPEG) → .jpg
-#  - IMU/GNSS (JSON)      → .parquet  (IMU_STORAGE_FORMAT=parquet)
-#                         → .json     (IMU_STORAGE_FORMAT=json)
+#  MinIO 예) daq/2026/04/30/09/KOR-1234/cam0/20260430T091530_xxx.jpg
+#  Local  예) /mnt/usb/DAQ/2026/04/30/09/KOR-1234/cam0/20260430T091530_xxx.jpg
 # ============================================================
 
 import os, json, struct, time, logging, io
 from datetime import datetime, timezone
+from pathlib import Path
 from confluent_kafka import Consumer, KafkaException, KafkaError
-from minio import Minio
-from minio.error import S3Error
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [minio-consumer] %(levelname)s: %(message)s")
 log = logging.getLogger("minio-consumer")
 
-# ── 환경변수 ─────────────────────────────────────────────────
+# ── 공통 환경변수 ─────────────────────────────────────────────
 KAFKA_BOOTSTRAP         = os.environ["KAFKA_BOOTSTRAP"]
 KAFKA_GROUP_ID          = os.environ.get("KAFKA_GROUP_ID", "minio-consumer-group")
 KAFKA_TOPICS            = os.environ["KAFKA_TOPICS"].split(",")
 KAFKA_AUTO_OFFSET_RESET = os.environ.get("KAFKA_AUTO_OFFSET_RESET", "earliest")
 
-MINIO_ENDPOINT   = os.environ["MINIO_ENDPOINT"].replace("http://","").replace("https://","")
-MINIO_ACCESS_KEY = os.environ["MINIO_ACCESS_KEY"]
-MINIO_SECRET_KEY = os.environ["MINIO_SECRET_KEY"]
+VEHICLE_ID   = os.environ.get("VEHICLE_ID", "UNKNOWN")
+BATCH_SIZE   = int(os.environ.get("BATCH_SIZE",     "100"))
+FLUSH_INTERVAL = int(os.environ.get("FLUSH_INTERVAL", "5"))
+
+IMU_STORAGE_FORMAT = os.environ.get("IMU_STORAGE_FORMAT", "parquet").lower()
+IMU_PARQUET_BATCH  = int(os.environ.get("IMU_PARQUET_BATCH", "1000"))
+
+# ── 스토리지 백엔드 선택 ──────────────────────────────────────
+# minio : MinIO S3
+# local : 로컬 디스크 / USB 마운트
+STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "minio").lower()
+
+# MinIO 설정
+MINIO_ENDPOINT   = os.environ.get("MINIO_ENDPOINT", "http://minio:9000").replace("http://","").replace("https://","")
+MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin123")
 MINIO_SECURE     = os.environ.get("MINIO_ENDPOINT","").startswith("https")
+MINIO_BUCKET     = os.environ.get("MINIO_BUCKET", "daq")
 
-MINIO_BUCKET = os.environ.get("MINIO_BUCKET",  "DAQ")
-VEHICLE_ID   = os.environ.get("VEHICLE_ID",    "UNKNOWN")
+# Local 설정
+LOCAL_BASE_PATH  = os.environ.get("LOCAL_BASE_PATH", "/mnt/storage/DAQ")
 
-# topic → sensor 폴더명 매핑
-TOPIC_SENSOR_MAP: dict[str, str] = json.loads(
+TOPIC_SENSOR_MAP: dict = json.loads(
     os.environ.get("TOPIC_SENSOR_MAP", json.dumps({
         "sensor.cam0.jpeg": "cam0",
         "sensor.cam1.jpeg": "cam1",
@@ -49,29 +59,23 @@ TOPIC_SENSOR_MAP: dict[str, str] = json.loads(
     }))
 )
 
-BATCH_SIZE     = int(os.environ.get("BATCH_SIZE",     "100"))
-FLUSH_INTERVAL = int(os.environ.get("FLUSH_INTERVAL", "5"))
-
-IMU_STORAGE_FORMAT = os.environ.get("IMU_STORAGE_FORMAT", "parquet").lower()
-IMU_PARQUET_BATCH  = int(os.environ.get("IMU_PARQUET_BATCH", "1000"))
-
-# ── Parquet 가용성 확인 ───────────────────────────────────────
+# ── Parquet ───────────────────────────────────────────────────
 try:
     import pyarrow as pa
     import pyarrow.parquet as pq
     PARQUET_AVAILABLE = True
 except ImportError:
     PARQUET_AVAILABLE = False
-    log.warning("pyarrow not installed — falling back to JSON for IMU/GNSS")
+    log.warning("pyarrow not installed — fallback to JSON")
 
 USE_PARQUET = (IMU_STORAGE_FORMAT == "parquet") and PARQUET_AVAILABLE
 
 
-# ── 오브젝트 경로 생성 ────────────────────────────────────────
-# DAQ/{year}/{month}/{day}/{hour}/{vehicle_id}/{sensor}/{timestamp}.{ext}
-def make_object_path(sensor: str, ts_ns: int, ext: str) -> str:
+# ── 경로 생성 (MinIO key / Local path 공통) ───────────────────
+def make_rel_path(sensor: str, ts_ns: int, ext: str) -> str:
+    """공통 상대경로: year/month/day/hour/vehicle_id/sensor/timestamp.ext"""
     ts = datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc)
-    timestamp = f"{ts.strftime('%Y%m%dT%H%M%S')}_{ts_ns}"
+    ts_str = f"{ts.strftime('%Y%m%dT%H%M%S')}_{ts_ns}"
     return (
         f"{ts.strftime('%Y')}/"
         f"{ts.strftime('%m')}/"
@@ -79,32 +83,79 @@ def make_object_path(sensor: str, ts_ns: int, ext: str) -> str:
         f"{ts.strftime('%H')}/"
         f"{VEHICLE_ID}/"
         f"{sensor}/"
-        f"{timestamp}.{ext}"
+        f"{ts_str}.{ext}"
     )
 
 
-def decode_camera(raw: bytes) -> tuple[bytes, int]:
-    if len(raw) < 12:
-        raise ValueError("too short")
-    ts_ns, plen = struct.unpack_from(">QI", raw, 0)
-    return raw[12:12 + plen], ts_ns
+# ── MinIO 백엔드 ──────────────────────────────────────────────
+class MinIOBackend:
+    def __init__(self):
+        from minio import Minio
+        self.client = Minio(MINIO_ENDPOINT,
+            access_key=MINIO_ACCESS_KEY,
+            secret_key=MINIO_SECRET_KEY,
+            secure=MINIO_SECURE)
+        if not self.client.bucket_exists(MINIO_BUCKET):
+            self.client.make_bucket(MINIO_BUCKET)
+            log.info("Created bucket: %s", MINIO_BUCKET)
+        log.info("MinIO backend ready  bucket=%s", MINIO_BUCKET)
+
+    def save(self, rel_path: str, data: bytes, content_type: str):
+        from minio.error import S3Error
+        try:
+            self.client.put_object(
+                MINIO_BUCKET, rel_path,
+                io.BytesIO(data), len(data),
+                content_type=content_type)
+            log.debug("MinIO saved: %s (%d B)", rel_path, len(data))
+        except S3Error as e:
+            log.error("MinIO save error: %s", e)
+            raise
+
+    def info(self) -> str:
+        return f"MinIO  bucket={MINIO_BUCKET}  endpoint={MINIO_ENDPOINT}"
 
 
-def is_camera_topic(topic: str) -> bool:
-    return "cam" in topic.lower()
+# ── Local 백엔드 ──────────────────────────────────────────────
+class LocalBackend:
+    def __init__(self):
+        base = Path(LOCAL_BASE_PATH)
+        base.mkdir(parents=True, exist_ok=True)
+        # 마운트 포인트 쓰기 가능 확인
+        test_file = base / ".write_test"
+        try:
+            test_file.write_bytes(b"ok")
+            test_file.unlink()
+        except OSError as e:
+            raise RuntimeError(f"LOCAL_BASE_PATH {LOCAL_BASE_PATH} not writable: {e}")
+        log.info("Local backend ready  base=%s", LOCAL_BASE_PATH)
+
+    def save(self, rel_path: str, data: bytes, content_type: str):
+        full_path = Path(LOCAL_BASE_PATH) / rel_path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_bytes(data)
+        log.debug("Local saved: %s (%d B)", full_path, len(data))
+
+    def info(self) -> str:
+        # 디스크 여유 공간 표시
+        import shutil
+        stat = shutil.disk_usage(LOCAL_BASE_PATH)
+        free_gb = stat.free / 1024**3
+        total_gb = stat.total / 1024**3
+        return f"Local  path={LOCAL_BASE_PATH}  free={free_gb:.1f}GB/{total_gb:.1f}GB"
 
 
-def build_minio() -> Minio:
-    client = Minio(MINIO_ENDPOINT, access_key=MINIO_ACCESS_KEY,
-                   secret_key=MINIO_SECRET_KEY, secure=MINIO_SECURE)
-    if not client.bucket_exists(MINIO_BUCKET):
-        client.make_bucket(MINIO_BUCKET)
-        log.info("Created bucket: %s", MINIO_BUCKET)
+# ── 백엔드 초기화 ─────────────────────────────────────────────
+def build_backend():
+    if STORAGE_BACKEND == "local":
+        return LocalBackend()
+    elif STORAGE_BACKEND == "minio":
+        return MinIOBackend()
     else:
-        log.info("Bucket exists: %s", MINIO_BUCKET)
-    return client
+        raise ValueError(f"Unknown STORAGE_BACKEND: {STORAGE_BACKEND}")
 
 
+# ── Kafka Consumer ────────────────────────────────────────────
 def build_consumer() -> Consumer:
     c = Consumer({
         "bootstrap.servers": KAFKA_BOOTSTRAP,
@@ -115,29 +166,33 @@ def build_consumer() -> Consumer:
         "max.partition.fetch.bytes": 5_242_880,
     })
     c.subscribe(KAFKA_TOPICS)
-    log.info("Subscribed topics: %s", KAFKA_TOPICS)
+    log.info("Subscribed: %s", KAFKA_TOPICS)
     return c
 
 
-def flush_parquet(rows: list[dict], sensor: str, minio_cli: Minio) -> int:
-    """IMU/GNSS rows → Parquet (snappy) → MinIO"""
+def decode_camera(raw: bytes) -> tuple:
+    if len(raw) < 12:
+        raise ValueError("too short")
+    ts_ns, plen = struct.unpack_from(">QI", raw, 0)
+    return raw[12:12 + plen], ts_ns
+
+
+def is_camera_topic(topic: str) -> bool:
+    return "cam" in topic.lower()
+
+
+def flush_parquet(rows: list, sensor: str, backend) -> int:
     if not rows:
         return 0
     try:
         table = pa.Table.from_pylist(rows)
         buf = io.BytesIO()
         pq.write_table(table, buf, compression="snappy")
-        buf.seek(0)
         ts_ns    = rows[0].get("ts_ns", time.time_ns())
-        obj_path = make_object_path(sensor, ts_ns, "parquet")
+        rel_path = make_rel_path(sensor, ts_ns, "parquet")
         data     = buf.getvalue()
-        minio_cli.put_object(
-            MINIO_BUCKET, obj_path,
-            io.BytesIO(data), len(data),
-            content_type="application/octet-stream",
-        )
-        log.info("Parquet  bucket=%s  path=%s  rows=%d  size=%d B",
-                 MINIO_BUCKET, obj_path, len(rows), len(data))
+        backend.save(rel_path, data, "application/octet-stream")
+        log.info("Parquet  path=%s  rows=%d  size=%dB", rel_path, len(rows), len(data))
         return 1
     except Exception as e:
         log.error("Parquet flush error: %s", e)
@@ -145,19 +200,21 @@ def flush_parquet(rows: list[dict], sensor: str, minio_cli: Minio) -> int:
 
 
 def main():
-    log.info("Starting  bucket=%s  vehicle=%s  imu_format=%s",
-             MINIO_BUCKET, VEHICLE_ID, "parquet" if USE_PARQUET else "json")
+    log.info("Starting  backend=%s  vehicle=%s  imu=%s",
+             STORAGE_BACKEND, VEHICLE_ID, "parquet" if USE_PARQUET else "json")
 
-    consumer  = build_consumer()
-    minio_cli = build_minio()
+    backend  = build_backend()
+    consumer = build_consumer()
 
-    pending_cam = []        # (obj_path, bytes, content_type)
+    log.info("Storage: %s", backend.info())
+
+    pending_cam = []        # (rel_path, bytes, content_type)
     pending_imu = {}        # sensor → list[dict]
     last_flush  = time.monotonic()
     total_saved = 0
+    last_info   = time.monotonic()
 
-    log.info("Consumer loop started  batch=%d  flush_interval=%ds",
-             BATCH_SIZE, FLUSH_INTERVAL)
+    log.info("Loop started  batch=%d  flush=%ds", BATCH_SIZE, FLUSH_INTERVAL)
 
     try:
         while True:
@@ -170,7 +227,7 @@ def main():
                 if code == KafkaError._PARTITION_EOF:
                     pass
                 elif code == KafkaError.UNKNOWN_TOPIC_OR_PART:
-                    log.warning("Topic not ready yet: %s", msg.error())
+                    log.warning("Topic not ready: %s", msg.error())
                     time.sleep(2)
                 else:
                     log.error("Kafka error: %s", msg.error())
@@ -179,32 +236,26 @@ def main():
                 raw    = msg.value()
                 sensor = TOPIC_SENSOR_MAP.get(topic)
                 if sensor is None:
-                    log.warning("Unknown topic: %s", topic)
                     continue
 
                 try:
                     if is_camera_topic(topic):
                         jpeg, ts_ns = decode_camera(raw)
-                        obj_path = make_object_path(sensor, ts_ns, "jpg")
-                        pending_cam.append((obj_path, jpeg, "image/jpeg"))
-
+                        rel_path = make_rel_path(sensor, ts_ns, "jpg")
+                        pending_cam.append((rel_path, jpeg, "image/jpeg"))
                     else:
                         payload = json.loads(raw.decode())
                         ts_ns   = payload.get("ts_ns", time.time_ns())
-
                         if USE_PARQUET:
                             pending_imu.setdefault(sensor, []).append(payload)
                         else:
-                            obj_path = make_object_path(sensor, ts_ns, "json")
-                            pending_cam.append((
-                                obj_path,
+                            rel_path = make_rel_path(sensor, ts_ns, "json")
+                            pending_cam.append((rel_path,
                                 json.dumps(payload, ensure_ascii=False).encode(),
-                                "application/json",
-                            ))
+                                "application/json"))
                 except Exception as e:
                     log.error("Decode error topic=%s: %s", topic, e)
 
-            # ── flush 조건 ────────────────────────────────────
             now      = time.monotonic()
             cam_full = len(pending_cam) >= BATCH_SIZE
             imu_full = USE_PARQUET and any(
@@ -214,48 +265,44 @@ def main():
             if cam_full or imu_full or time_up:
                 saved = 0
 
-                # Camera / JSON flush
                 for (path, data, ctype) in pending_cam:
                     try:
-                        minio_cli.put_object(
-                            MINIO_BUCKET, path,
-                            io.BytesIO(data), len(data),
-                            content_type=ctype,
-                        )
+                        backend.save(path, data, ctype)
                         saved += 1
-                    except S3Error as e:
-                        log.error("MinIO put error: %s", e)
+                    except Exception as e:
+                        log.error("Save error: %s", e)
 
-                # IMU Parquet flush
                 for sensor_key, rows in list(pending_imu.items()):
                     if rows:
-                        saved += flush_parquet(rows, sensor_key, minio_cli)
+                        saved += flush_parquet(rows, sensor_key, backend)
                         pending_imu[sensor_key] = []
 
                 consumer.commit(asynchronous=False)
                 total_saved += saved
-                log.info("Flushed %d objects  total=%d", saved, total_saved)
+                log.info("Flushed %d  total=%d", saved, total_saved)
                 pending_cam.clear()
                 last_flush = time.monotonic()
+
+            # 60초마다 스토리지 상태 로그
+            if now - last_info >= 60:
+                log.info("Storage status: %s", backend.info())
+                last_info = now
 
     except KeyboardInterrupt:
         pass
     finally:
-        log.info("Shutdown — flushing remaining data...")
+        log.info("Shutdown — flushing remaining...")
         for (path, data, ctype) in pending_cam:
             try:
-                minio_cli.put_object(MINIO_BUCKET, path,
-                    io.BytesIO(data), len(data), content_type=ctype)
+                backend.save(path, data, ctype)
             except Exception as e:
                 log.error("Final flush error: %s", e)
-
         for sensor_key, rows in pending_imu.items():
             if rows:
-                flush_parquet(rows, sensor_key, minio_cli)
-
+                flush_parquet(rows, sensor_key, backend)
         consumer.commit(asynchronous=False)
         consumer.close()
-        log.info("Consumer closed.  total_saved=%d", total_saved)
+        log.info("Closed. total_saved=%d", total_saved)
 
 
 if __name__ == "__main__":
