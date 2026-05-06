@@ -177,8 +177,8 @@ services:
     command:
       - |
         mc alias set local http://minio:9000 minioadmin minioadmin123
-        mc mb --ignore-existing local/DAQ
-        echo "MinIO bucket DAQ initialized."
+        mc mb --ignore-existing local/daq
+        echo "MinIO bucket daq initialized."
     restart: on-failure
 
 # ─────────────────────────────────────────────
@@ -291,7 +291,7 @@ services:
     # STORAGE_BACKEND=local 사용 시 아래 volumes 주석 해제
     # volumes:
     #   - /mnt/usb:/mnt/usb               # USB 마운트
-    #   - /data/DAQ:/mnt/storage/DAQ      # 내부 디스크
+    #   - /data/daq:/mnt/storage/daq      # 내부 디스크
     environment:
       KAFKA_BOOTSTRAP: kafka-broker:9092
       KAFKA_GROUP_ID: minio-consumer-group
@@ -301,8 +301,8 @@ services:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin123
       # 단일 버킷 + 차량번호
-      MINIO_BUCKET: DAQ
-      VEHICLE_ID: KOR-1234             # config.env 의 VEHICLE_ID 와 동일하게 설정
+      MINIO_BUCKET: daq
+      VEHICLE_ID: Grandeur-2288             # config.env 의 VEHICLE_ID 와 동일하게 설정
       # topic → sensor 폴더명 매핑 (JSON)
       TOPIC_SENSOR_MAP: >
         {
@@ -312,7 +312,7 @@ services:
           "sensor.imu":       "imu",
           "sensor.gnss":      "gnss"
         }
-      # 경로: DAQ/{year}/{month}/{day}/{hour}/{vehicle_id}/{sensor}/{timestamp}.{ext}
+      # 경로: daq/{year}/{month}/{day}/{hour}/{vehicle_id}/{sensor}/{timestamp}.{ext}
       BATCH_SIZE: 100
       FLUSH_INTERVAL: 5
       IMU_STORAGE_FORMAT: parquet
@@ -322,4 +322,4 @@ services:
       # local : 로컬 디스크 / USB 마운트
       STORAGE_BACKEND: auto          # auto|minio|local
       LOCAL_BASE_PATH: /media/swm    # USB 마운트 루트 ($USER 자동 치환)
-      LOCAL_FALLBACK_PATH: /data/DAQ # USB 없을 때 내부 디스크
+      LOCAL_FALLBACK_PATH: /data/daq # USB 없을 때 내부 디스크
